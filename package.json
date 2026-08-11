@@ -1,0 +1,21 @@
+{
+  "name": "treo-wuthering-waves",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Persistent Wuthering Waves Discord rich presence",
+  "main": "index.js",
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "start:gc": "node --expose-gc index.js",
+    "test": "node --check index.js"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "^3.7.1",
+    "express": "^5.2.1",
+    "discord.js": "^14.21.0"
+  }
+}
