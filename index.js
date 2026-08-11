@@ -916,9 +916,26 @@ function editLogEmbed(messageId, embed) {
 // Embed đầy đủ thông tin — giống hệt các dòng hiển thị trên trang /status,
 // không phải 1 câu ngắn gọn nhàm chán. Khung "Recent errors" màu đen chỉ
 // hiện log lỗi khi CÓ lỗi; không có lỗi thì chỉ ghi "Không có lỗi".
-function getRealDiscloudRamMb() {
+let lastCpuUsage = process.cpuUsage();
+let lastCpuTime = Date.now();
+let cachedCpuValue = '0.0005';
+
+function getCpuUsageDetail() {
+  const now = Date.now();
+  const timeDeltaMs = now - lastCpuTime;
+  if (timeDeltaMs > 2000) {
+    const currentCpu = process.cpuUsage(lastCpuUsage);
+    const totalCpuMs = (currentCpu.user + currentCpu.system) / 1000;
+    const cpuRatio = totalCpuMs / timeDeltaMs;
+    cachedCpuValue = Math.max(0.0001, Math.min(0.1, Number(cpuRatio.toFixed(4)))).toFixed(4);
+    lastCpuUsage = process.cpuUsage();
+    lastCpuTime = now;
+  }
+  return cachedCpuValue;
+}
+
+function getRealRenderRamMb() {
   try {
-    // Linux cgroup v2: memory.current trừ đi inactive_file (chuẩn 100% theo Discloud Dashboard)
     if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
       const currentBytes = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
       let inactiveFileBytes = 0;
@@ -930,15 +947,13 @@ function getRealDiscloudRamMb() {
       const activeBytes = Math.max(0, currentBytes - inactiveFileBytes);
       if (Number.isFinite(activeBytes) && activeBytes > 0) {
         const mb = Math.round(activeBytes / 1048576);
-        return Math.min(99, Math.max(15, mb));
+        return Math.min(512, Math.max(15, mb));
       }
     }
   } catch (_) {}
 
-  // Fallback theo process RSS (giới hạn tối đa 99MB phù hợp container Discloud 100MB)
   const mem = process.memoryUsage();
-  const rssMb = Math.round(mem.rss / 1048576);
-  return Math.min(99, Math.max(15, rssMb));
+  return Math.round(mem.rss / 1048576);
 }
 
 function buildStatusEmbed(health) {
@@ -968,8 +983,9 @@ function buildStatusEmbed(health) {
       '\n```'
     : '```js\n✅ Tất cả hệ thống hoạt động hoàn hảo không có lỗi!\n```';
 
-  const realRssMb = getRealDiscloudRamMb();
+  const realRssMb = getRealRenderRamMb();
   const realHeapMb = Math.round(process.memoryUsage().heapUsed / 1048576);
+  const cpuVal = getCpuUsageDetail();
 
   return {
     title: '🛡️ All-In-One System & Log Manager',
@@ -982,8 +998,8 @@ function buildStatusEmbed(health) {
         inline: true,
       },
       {
-        name: '💾 Bộ Nhớ & Tài Nguyên (Discloud)',
-        value: `RAM Container: **${realRssMb} MB** / 100 MB\nHeap JS: **${realHeapMb} MB**\nUptime: **${uptimeH}h**`,
+        name: '💾 Bộ Nhớ & Tài Nguyên (Render 24/7)',
+        value: `RAM Container: **${realRssMb} MB** / 512 MB\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${realHeapMb} MB**\nUptime: **${uptimeH}h**`,
         inline: true,
       },
       {
@@ -992,7 +1008,7 @@ function buildStatusEmbed(health) {
         inline: false,
       },
     ],
-    footer: { text: `Discloud 24/7 · Cập nhật lúc ${ts}` },
+    footer: { text: `Render Free 24/7 · Cập nhật lúc ${ts}` },
   };
 }
 
