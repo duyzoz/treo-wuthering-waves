@@ -1,27 +1,19 @@
 services:
   - type: web
-    name: treo-wuthering-waves
+    name: treo-wuthering-waves-official
     runtime: node
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: cp package.official.json package.json && npm install --omit=dev
+    startCommand: FULL_OFFICIAL_MODE=true npm start
     healthCheckPath: /health
     envVars:
-      - key: TOKEN_DISCORD
-        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: LOG_CHANNEL_ID
         sync: false
-      - key: WELCOME_CHANNEL_ID
+      - key: ADMIN_USER_IDS
         sync: false
-      - key: GOODBYE_CHANNEL_ID
+      - key: ADMIN_CONFIG_KEY
         sync: false
-      - key: FAKE_MEMBER_OFFSET
-        value: "0"
-      - key: OFFICIAL_BOT_MODE
-        value: "true"
-      - key: FULL_OFFICIAL_MODE
-        value: "false"
       - key: STATUS_GIF_URL
         sync: false
       - key: EMBED_COLOR
@@ -34,27 +26,13 @@ services:
         value: "07:00"
       - key: NIGHT_SAVER_TZ
         value: "Asia/Ho_Chi_Minh"
-      - key: ADMIN_USER_IDS
-        sync: false
-      - key: ADMIN_CONFIG_KEY
-        sync: false
       - key: MAX_REQUESTS_PER_DAY
         value: "400"
       - key: MAX_DISCORD_UPDATES_PER_DAY
         value: "300"
       - key: MAX_IO_PER_DAY
         value: "1200"
-      - key: DISABLE_WELCOME
-        value: "false"
-      - key: DISABLE_GOODBYE
-        value: "false"
       - key: OBSERVABILITY_FILE
         value: "data/observability.json"
       - key: MONITOR_INTERVAL_MS
         value: "300000"
-      - key: DISABLE_MONITOR
-        value: "false"
-      - key: WELCOME_THROTTLE_MS
-        value: "1800000"
-      - key: UPTIME_START_TIMESTAMP
-        sync: false

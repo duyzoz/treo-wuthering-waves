@@ -10,6 +10,7 @@ const { createRemoteConfig } = require('./remote-config');
 const { createStorageAdapter } = require('./storage-adapter');
 const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require('./ops-guard');
 const { createConfigBackup } = require('./config-backup');
+const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
 
 (async () => {
   const engine = createPresenceEngine(['⚔️ Hunting: Dreamless', '🗼 Tower of Adversity — Floor 10'], { minRotateMs: 1, maxRotateMs: 1 });
@@ -38,8 +39,15 @@ const { createConfigBackup } = require('./config-backup');
   const backup = createConfigBackup(path.join(dir, 'remote-config.json')); backup.backup(config.get()); assert.equal(backup.list().length, 1); assert.equal(backup.rollback().version, config.get().version);
   const storage = createStorageAdapter({ filePath: path.join(dir, 'storage.json') }); await storage.write({ ok: true }); assert.deepEqual(await storage.read(), { ok: true });
 
+  const budget = createResourceGovernor({ maxRequestsPerDay: 2, maxDiscordUpdatesPerDay: 1, maxIoPerDay: 2 });
+  assert.equal(budget.consume('request'), true, 'budget first request');
+  assert.equal(budget.consume('request'), true, 'budget second request');
+  assert.equal(budget.consume('request'), false, 'budget third request blocked');
+  assert.equal(budget.snapshot().mode, 'health-only', 'budget health-only mode');
+  assert.equal(nextAdaptiveDelay({ baseMs: 300000, health: { container: { memory: { bytes: 900, limitBytes: 1000 } } } }), 900000, 'adaptive delay');
+
   let calls = 0; const governor = new RestTrafficGovernor({ maxPerSecond: 1000, burst: 1, fetchImpl: async () => { calls += 1; return new Response(JSON.stringify({ retry_after: 0.01, global: true }), { status: 429, headers: { 'content-type': 'application/json', 'x-ratelimit-global': 'true' } }); } });
   await governor.request('https://discord.test/api', {}, '/test').then(() => assert.fail('expected rate limit')).catch((error) => { assert.equal(error.name, 'DiscordRateLimitError'); assert.equal(error.global, true); });
   assert.equal(calls, 1); assert.ok(governor.snapshot().globalBlockedUntil > Date.now());
-  console.log('wave 11-15 regression tests: ok');
+  console.log('wave 16-20 regression tests: ok');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -11,8 +11,13 @@ const { createRemoteConfig } = require('./remote-config');
 const { createStorageAdapter } = require('./storage-adapter');
 const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require('./ops-guard');
 const { createConfigBackup } = require('./config-backup');
+const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
 
-const { Client, Options, RichPresence } = require('discord.js-selfbot-v13');
+const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
+const selfbotLib = FULL_OFFICIAL_MODE
+  ? { Client: require('discord.js').Client, Options: require('discord.js').Options, RichPresence: null }
+  : require('discord.js-selfbot-v13');
+const { Client, Options, RichPresence } = selfbotLib;
 
 // ---------------------------------------------------------------------------
 // Config từ env — tuỳ chỉnh trên Render mà không cần sửa code
@@ -28,7 +33,6 @@ const CFG = {
   embedColor:     Number(process.env.EMBED_COLOR || 0x6d5dfc),
 };
 
-const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
 const RUN_SELF_BOT = !FULL_OFFICIAL_MODE && process.env.ALLOW_DISCORD_RUN !== 'false';
 const RUN_DISCORD = RUN_SELF_BOT;
 const DISCORD_TOKEN = RUN_SELF_BOT ? (process.env.TOKEN_DISCORD || process.env.TOKEN) : null;
@@ -64,17 +68,20 @@ const logger = logs.wrapLogger(rawLogger, 'main');
 // HTTP server — phải lên trước Discord login để Render không timeout health
 // ---------------------------------------------------------------------------
 const app = express();
+app.use(express.json({ limit: '16kb' }));
 const port = Number(process.env.PORT) || 5000;
 const TIME_FILE = path.join(__dirname, 'starttime.json');
 const OBSERVABILITY_FILE = process.env.OBSERVABILITY_FILE || path.join(__dirname, 'data', 'observability.json');
 const observability = createObservability(OBSERVABILITY_FILE, { sampleEveryMs: 5 * 60 * 1000 });
 const timeline = createIncidentTimeline(process.env.INCIDENTS_FILE || path.join(__dirname, 'data', 'incidents.json'));
 const anomalyGuard = createAnomalyGuard({ cooldownMs: 30 * 60 * 1000 });
+const resourceGovernor = createResourceGovernor({ maxRequestsPerDay: Number(process.env.MAX_REQUESTS_PER_DAY) || 400, maxDiscordUpdatesPerDay: Number(process.env.MAX_DISCORD_UPDATES_PER_DAY) || 300, maxIoPerDay: Number(process.env.MAX_IO_PER_DAY) || 1200 });
 const remoteConfig = createRemoteConfig(process.env.REMOTE_CONFIG_FILE || path.join(__dirname, 'data', 'remote-config.json'));
 const configBackup = createConfigBackup(process.env.REMOTE_CONFIG_FILE || path.join(__dirname, 'data', 'remote-config.json'));
 const existingConfigBackup = configBackup.list()[0];
 if (!existingConfigBackup || existingConfigBackup.checksum !== configBackup.checksum(remoteConfig.get())) configBackup.backup(remoteConfig.get());
 let maintenanceMode = false;
+const ADMIN_CONFIG_KEY = process.env.ADMIN_CONFIG_KEY || '';
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
 if (process.env.PERSISTENCE_URL) persistence.read().then((snapshot) => {
@@ -144,6 +151,7 @@ app.get('/health', (_req, res) => {
     presence: { category: currentPresenceCategory, durationMinutes: currentPresenceDurationMinutes },
     nightSaver: { active: isNightSaverActive(), start: process.env.NIGHT_SAVER_START || '23:00', end: process.env.NIGHT_SAVER_END || '07:00', timezone: process.env.NIGHT_SAVER_TZ || 'Asia/Ho_Chi_Minh' },
     anomalyGuard: anomalyGuard.snapshot(),
+    resourceBudget: resourceGovernor.snapshot(),
     maintenanceMode,
     observability: observability.summary(),
     restGovernor: restGovernor.snapshot(),
@@ -169,7 +177,43 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/incidents', (_req, res) => res.status(200).json({ window: '24h', events: timeline.recent(50) }));
-app.get('/config', (_req, res) => res.status(200).json({ version: remoteConfig.get().version, config: remoteConfig.get(), audit: remoteConfig.audit() }));
+function isAdminRequest(req) {
+  return Boolean(ADMIN_CONFIG_KEY) && req.get('x-admin-key') === ADMIN_CONFIG_KEY;
+}
+app.get('/config', (req, res) => {
+  if (!isAdminRequest(req)) return res.status(404).json({ error: 'Not found' });
+  return res.status(200).json({ version: remoteConfig.get().version, config: remoteConfig.get(), audit: remoteConfig.audit() });
+});
+app.get('/public', (_req, res) => {
+  const memory = getRealRenderRam();
+  const ratio = memory.limitBytes ? memory.bytes / memory.limitBytes : 0;
+  const officialReady = Boolean(officialBot?.client?.isReady?.());
+  const online = Boolean(discordReady || officialReady);
+  const digest = buildIncidentDigest(timeline.recent(50));
+  const uptimeH = ((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1);
+  res.type('html').send(`<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>WW Status</title><style>body{margin:0;background:#0b1020;color:#e9e7ff;font:14px system-ui;padding:24px}main{max-width:620px;margin:auto;background:linear-gradient(145deg,#17163b,#0d2942);border:1px solid #6657d9;border-radius:18px;padding:20px;box-shadow:0 12px 40px #0008}h1{margin:0 0 14px;color:#b8b2ff}.badge{display:inline-block;padding:6px 10px;border-radius:99px;background:${online ? '#153e31' : '#4a1f34'};color:${online ? '#6fffd2' : '#ff8ba7'}}.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #ffffff18}.bar{height:8px;background:#242750;border-radius:8px;overflow:hidden}.bar i{display:block;height:100%;width:${Math.min(100, Math.max(0, ratio * 100)).toFixed(1)}%;background:linear-gradient(90deg,#57d6ff,#9d6bff)}</style><main><h1>🌊 Wuthering Waves</h1><span class="badge">${online ? 'ONLINE' : 'OFFLINE'}</span><div class="row"><span>Uptime</span><b>${uptimeH}h</b></div><div class="row"><span>Memory</span><b>${memory.mib.toFixed(2)} / ${(memory.limitBytes / 1048576).toFixed(0)} MiB</b></div><div class="bar"><i></i></div><div class="row"><span>CPU</span><b>${getCpuUsageDetail()}</b></div><div class="row"><span>Incidents</span><b>${digest.icon} ${digest.level}</b></div><small>Updated ${new Date().toISOString()}</small></main>`);
+});
+app.get('/admin/config', (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Admin key required' });
+  return res.status(200).json({ version: remoteConfig.get().version, config: remoteConfig.get(), audit: remoteConfig.audit(), backups: configBackup.list().map((item) => ({ createdAt: item.createdAt, checksum: item.checksum })) });
+});
+app.post('/admin/config', (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Admin key required' });
+  try {
+    configBackup.backup(remoteConfig.get());
+    const next = remoteConfig.update(req.body || {}, 'web-admin');
+    timeline.record('CONFIG_UPDATE', `Remote config v${next.version}`);
+    return res.status(200).json({ ok: true, config: next });
+  } catch (error) { return res.status(400).json({ ok: false, error: error.message }); }
+});
+app.post('/admin/config/rollback', (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Admin key required' });
+  try {
+    const restored = configBackup.rollback(Number(req.body?.index || 0));
+    timeline.record('CONFIG_ROLLBACK', 'Config restored from checksum backup');
+    return res.status(200).json({ ok: true, config: restored });
+  } catch (error) { return res.status(400).json({ ok: false, error: error.message }); }
+});
 
 app.get('/ready', (_req, res) => {
   const officialReady = !officialBot || officialBot.client.isReady();
@@ -234,6 +278,7 @@ app.listen(port, '0.0.0.0', () => {
 // ---------------------------------------------------------------------------
 const client = new Client({
   checkUpdate: false,
+  intents: FULL_OFFICIAL_MODE ? [1, 2] : undefined,
   makeCache: Options.cacheWithLimits({
     ...Options.defaultMakeCacheSettings,
     MessageManager:     RUN_SELF_BOT ? 10 : 0,
@@ -1290,8 +1335,13 @@ async function pushStatusEmbed(embed) {
   }
 }
 
+let consecutiveHealthyMonitorTicks = 0;
 async function runMonitorTick() {
-  if (monitorInFlight || maintenanceMode || Date.now() < monitorRateLimitedUntil) return;
+  if (monitorInFlight || maintenanceMode || Date.now() < monitorRateLimitedUntil) return { skipped: true };
+  if (!resourceGovernor.consume('request')) {
+    timeline.record('BUDGET_HEALTH_ONLY', 'Đạt ngân sách request/ngày; chỉ giữ health/ping');
+    return { skipped: true, budget: true, nextDelay: 30 * 60 * 1000 };
+  }
   monitorInFlight = true;
   try {
     const res = await fetch(STATUS_URL, { signal: AbortSignal.timeout(10_000) });
@@ -1302,14 +1352,24 @@ async function runMonitorTick() {
       timeline.record(anomaly.code, anomaly.reasons.join(' · '), { severity: anomaly.severity });
       health.incidents = timeline.recent(50);
     }
-    await pushStatusEmbed(buildStatusEmbed(health));
+    if (resourceGovernor.can('discordUpdate')) {
+      await pushStatusEmbed(buildStatusEmbed(health));
+      resourceGovernor.consume('discordUpdate');
+    } else {
+      timeline.record('BUDGET_HEALTH_ONLY', 'Đã chạm ngân sách Discord update; bỏ qua edit embed');
+    }
+    consecutiveHealthyMonitorTicks += 1;
+    return { health, nextDelay: nextAdaptiveDelay({ baseMs: MONITOR_INTERVAL_MS, health, consecutiveHealthy: consecutiveHealthyMonitorTicks }) };
   } catch (e) {
     if (isDiscordRateLimitError(e)) {
       monitorRateLimitedUntil = Math.max(monitorRateLimitedUntil, Date.now() + e.retryAfterMs);
+      consecutiveHealthyMonitorTicks = 0;
       logger.info(`[monitor] Log channel đang throttle — tạm dừng vòng monitor ${Math.ceil(e.retryAfterMs / 1000)}s; không ghi là lỗi.`);
-      return;
+      return { rateLimited: true, nextDelay: Math.max(MONITOR_INTERVAL_MS, e.retryAfterMs) };
     }
+    consecutiveHealthyMonitorTicks = 0;
     logger.error('[monitor] Không ping được /health hoặc gửi Discord:', e.message);
+    return { error: true, nextDelay: Math.min(30 * 60 * 1000, MONITOR_INTERVAL_MS * 3) };
   } finally {
     monitorInFlight = false;
   }
@@ -1324,12 +1384,18 @@ if (officialBot) {
   });
 }
 
+let monitorTimer = null;
+function scheduleMonitor(delayMs) {
+  clearTimeout(monitorTimer);
+  monitorTimer = setTimeout(async () => {
+    const result = await runMonitorTick();
+    scheduleMonitor(result?.nextDelay || MONITOR_INTERVAL_MS);
+  }, Math.max(30_000, delayMs));
+  monitorTimer.unref();
+}
 if (BOT_TOKEN && LOG_CHANNEL_ID && !DISABLE_MONITOR) {
-  logger.info(
-    `[monitor] Log bot kích hoạt — ping mỗi ${MONITOR_INTERVAL_MS / 1000}s tới ${STATUS_URL} (bắt đầu sau 30s)`,
-  );
-  setInterval(runMonitorTick, MONITOR_INTERVAL_MS).unref();
-  setTimeout(runMonitorTick, 30_000).unref();
+  logger.info(`[monitor] Log bot kích hoạt — adaptive polling bắt đầu sau 30s, min ${MONITOR_INTERVAL_MS / 1000}s`);
+  scheduleMonitor(30_000);
 } else {
   logger.info('[monitor] Đã tắt hoặc bỏ qua tính năng log Discord (tiết kiệm REST traffic).');
 }

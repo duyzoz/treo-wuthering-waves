@@ -57,6 +57,18 @@ Wave 14 đăng ký slash commands một lần khi official bot ready: `/status`,
 
 Wave 15 dùng `config-backup.js`, lưu tối đa 5 bản backup nhỏ trong file `.backups.json`, xác minh SHA-256 trước rollback và ghi atomic. Dữ liệu runtime nằm trong thư mục `data/` và không được commit.
 
+## Wave 16–20 và profile Render
+
+Wave 16 giới hạn mặc định `400` request/ngày, `300` Discord update/ngày và `1200` I/O/ngày qua `MAX_REQUESTS_PER_DAY`, `MAX_DISCORD_UPDATES_PER_DAY` và `MAX_IO_PER_DAY`. Khi chạm hạn mức, bot chuyển sang `health-only` và không edit Discord nữa.
+
+Wave 17 dùng adaptive polling một timeout duy nhất. Trạng thái ổn định giữ chu kỳ tối thiểu 5 phút; RAM cao, CPU cao, reconnect hoặc rate-limit sẽ kéo dài tối đa 15–30 phút, sau đó hạ dần khi ổn định.
+
+Wave 18 cung cấp `GET /public`, chỉ hiển thị Online/Offline, uptime, RAM, CPU và incident level. Route này không trả token, channel ID, admin key hoặc cấu hình nội bộ.
+
+Wave 19 cung cấp `GET /admin/config`, `POST /admin/config` và `POST /admin/config/rollback`. Các route yêu cầu header `x-admin-key` khớp `ADMIN_CONFIG_KEY`, tự backup trước update và validation giới hạn body 16 KiB.
+
+Wave 20 có blueprint `render-official.yaml`. Profile này dùng `package.official.json`, chỉ cài `discord.js` chính thức và `express`, chạy `FULL_OFFICIAL_MODE=true`, không nạp package selfbot. Profile hiện tại `render.yaml` vẫn giữ rich presence legacy để không thay đổi hành vi tài khoản đang dùng.
+
 ## Tài liệu tham khảo
 
 Discord rate limits: <https://docs.discord.com/developers/topics/rate-limits>

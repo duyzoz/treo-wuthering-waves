@@ -1,0 +1,14 @@
+{
+  "name": "treo-wuthering-waves-official",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Low-resource official Discord status bot",
+  "main": "index.js",
+  "engines": { "node": "20.x" },
+  "scripts": { "start": "node index.js", "test": "node --check index.js" },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "express": "^5.2.1"
+  }
+}
