@@ -5,10 +5,10 @@ const {
   ActivityType,
 } = require('discord.js');
 
-function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChannelId, commands = [], onCommand, onMemberJoin, onMemberLeave, onError }) {
+function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChannelId, memberEvents = false, commands = [], onCommand, onMemberJoin, onMemberLeave, onError }) {
   if (!token) return null;
   const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+    intents: [GatewayIntentBits.Guilds, ...(memberEvents ? [GatewayIntentBits.GuildMembers] : [])],
     partials: [Partials.GuildMember, Partials.User],
   });
 
@@ -19,8 +19,10 @@ function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChann
       catch (error) { onError?.(error); }
     }
   });
-  client.on('guildMemberAdd', (member) => onMemberJoin?.(member));
-  client.on('guildMemberRemove', (member) => onMemberLeave?.(member));
+  if (memberEvents) {
+    client.on('guildMemberAdd', (member) => onMemberJoin?.(member));
+    client.on('guildMemberRemove', (member) => onMemberLeave?.(member));
+  }
   client.on('error', (error) => onError?.(error));
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand() || !onCommand) return;

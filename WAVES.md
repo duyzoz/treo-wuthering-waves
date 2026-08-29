@@ -28,6 +28,7 @@ Wave 5 bật `OFFICIAL_BOT_MODE=true` trên Render. Bot chính thức dùng `dis
 | `DISABLE_WELCOME` | `false` | Tắt riêng welcome khi cần |
 | `DISABLE_GOODBYE` | `false` | Tắt riêng goodbye khi cần |
 | `OBSERVABILITY_FILE` | `data/observability.json` | Nơi lưu snapshot 24 giờ |
+| `ENABLE_MEMBER_EVENTS` | `false` | Chỉ đặt `true` sau khi bật Server Members Intent trong Discord Developer Portal |
 
 ## Nguyên tắc tiết kiệm Render Free
 
@@ -76,3 +77,5 @@ Discord rate limits: <https://docs.discord.com/developers/topics/rate-limits>
 Discord Gateway: <https://docs.discord.com/developers/events/gateway>
 
 Discord privileged intents: <https://support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents>
+
+Nếu Render báo `Used disallowed intents`, token bot không nhất thiết sai. Bản sửa mặc định dùng `ENABLE_MEMBER_EVENTS=false`, chỉ yêu cầu intent `Guilds` nên bot log, slash commands và status vẫn đăng nhập được. Chỉ bật `ENABLE_MEMBER_EVENTS=true` sau khi đã bật Server Members Intent trong Developer Portal; nếu không cần welcome/goodbye tự động thì để `false` để giảm quyền và tránh lỗi Gateway.

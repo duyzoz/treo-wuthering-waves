@@ -1067,6 +1067,7 @@ const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
       logChannelId: LOG_CHANNEL_ID,
       welcomeChannelId: DISABLE_WELCOME ? null : WELCOME_CHANNEL_ID,
       goodbyeChannelId: DISABLE_GOODBYE ? null : GOODBYE_CHANNEL_ID,
+      memberEvents: process.env.ENABLE_MEMBER_EVENTS === 'true',
       onMemberJoin: (member) => queueWelcomeEvent('join', member),
       onMemberLeave: (member) => queueWelcomeEvent('leave', member),
       commands: COMMANDS,
@@ -1090,7 +1091,11 @@ const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
           return interaction.reply({ content: maintenanceMode ? '🛠️ Maintenance mode đã bật.' : '✅ Maintenance mode đã tắt.', ephemeral: true });
         }
       },
-      onError: (error) => { errorCount++; logger.error('[official-bot] Client error:', error.message); },
+      onError: (error) => {
+        const message = String(error?.message || error);
+        if (message.includes('disallowed intents') || error?.code === 4014) logger.warn('[official-bot] GuildMembers intent chưa được bật; bot log vẫn có thể chạy, welcome/goodbye member events đang tắt.');
+        else { errorCount++; logger.error('[official-bot] Client error:', message); }
+      },
     })
   : null;
 
@@ -1338,6 +1343,7 @@ async function pushStatusEmbed(embed) {
 let consecutiveHealthyMonitorTicks = 0;
 async function runMonitorTick() {
   if (monitorInFlight || maintenanceMode || Date.now() < monitorRateLimitedUntil) return { skipped: true };
+  if (officialBot && !officialBot.client.isReady()) return { skipped: true, nextDelay: MONITOR_INTERVAL_MS };
   if (!resourceGovernor.consume('request')) {
     timeline.record('BUDGET_HEALTH_ONLY', 'Đạt ngân sách request/ngày; chỉ giữ health/ping');
     return { skipped: true, budget: true, nextDelay: 30 * 60 * 1000 };
@@ -1379,8 +1385,9 @@ const DISABLE_MONITOR = process.env.DISABLE_MONITOR === 'true';
 
 if (officialBot) {
   officialBot.login().then(() => logger.info('[official-bot] Bot chính thức đã kết nối Gateway.')).catch((error) => {
-    errorCount++;
-    logger.error('[official-bot] Login thất bại:', error.message);
+    const message = String(error?.message || error);
+    if (message.includes('disallowed intents') || error?.code === 4014) logger.warn('[official-bot] Login bị từ chối do privileged intent; hãy bật ENABLE_MEMBER_EVENTS chỉ khi đã bật intent trong Developer Portal.');
+    else { errorCount++; logger.error('[official-bot] Login thất bại:', message); }
   });
 }
 

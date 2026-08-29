@@ -12,6 +12,8 @@ services:
         sync: false
       - key: ADMIN_USER_IDS
         sync: false
+      - key: ENABLE_MEMBER_EVENTS
+        value: "false"
       - key: ADMIN_CONFIG_KEY
         sync: false
       - key: STATUS_GIF_URL
