@@ -17,7 +17,15 @@ services:
       - key: GOODBYE_CHANNEL_ID
         sync: false
       - key: FAKE_MEMBER_OFFSET
-        value: "1280"
+        value: "0"
+      - key: OFFICIAL_BOT_MODE
+        value: "true"
+      - key: DISABLE_WELCOME
+        value: "false"
+      - key: DISABLE_GOODBYE
+        value: "false"
+      - key: OBSERVABILITY_FILE
+        value: "data/observability.json"
       - key: MONITOR_INTERVAL_MS
         value: "300000"
       - key: WELCOME_THROTTLE_MS

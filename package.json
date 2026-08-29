@@ -11,9 +11,10 @@
   "scripts": {
     "start": "node index.js",
     "start:gc": "node --expose-gc index.js",
-    "test": "node --check index.js"
+    "test": "node --check index.js && node --check official-bot.js && node --check observability.js && node --check presence-engine.js && node --check rest-governor.js && node test-waves.js"
   },
   "dependencies": {
+    "discord.js": "^14.27.0",
     "discord.js-selfbot-v13": "^3.7.1",
     "express": "^5.2.1"
   }

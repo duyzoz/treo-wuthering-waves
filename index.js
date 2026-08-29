@@ -2,6 +2,10 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const logs = require('./logs');
+const { createPresenceEngine } = require('./presence-engine');
+const { createObservability } = require('./observability');
+const { createOfficialBot } = require('./official-bot');
+const { RestTrafficGovernor } = require('./rest-governor');
 
 const { Client, Options, RichPresence } = require('discord.js-selfbot-v13');
 
@@ -53,6 +57,8 @@ const logger = logs.wrapLogger(rawLogger, 'main');
 const app = express();
 const port = Number(process.env.PORT) || 5000;
 const TIME_FILE = path.join(__dirname, 'starttime.json');
+const OBSERVABILITY_FILE = process.env.OBSERVABILITY_FILE || path.join(__dirname, 'data', 'observability.json');
+const observability = createObservability(OBSERVABILITY_FILE, { sampleEveryMs: 5 * 60 * 1000 });
 
 let discordReady = false;
 let loginRetryTimer = null;
@@ -62,8 +68,12 @@ let errorCount = 0;
 let lastPresenceUpdate = null;
 let lastActivity = null;    // tên activity đang hiển thị
 let rateLimitCount = 0;
+let lastMemoryWarningAt = 0;
 let processStartTime = Date.now();
 let uptimeStartTimestamp = null;
+let lastReadyAt = null;
+let lastDisconnectAt = null;
+let lastLoginStartedAt = 0;
 
 // /ping — endpoint nhẹ nhất cho UptimeRobot (không cần parse JSON)
 app.get('/ping', (_req, res) => res.status(200).send('pong'));
@@ -77,10 +87,20 @@ app.get('/', (_req, res) => {
 app.get('/health', (_req, res) => {
   const mem = process.memoryUsage();
   const container = getRealRenderRam();
+  const memoryRatio = container.limitBytes > 0 ? container.memoryBytes / container.limitBytes : 0;
+  if (memoryRatio >= 0.85 && Date.now() - lastMemoryWarningAt > 15 * 60 * 1000) {
+    lastMemoryWarningAt = Date.now();
+    logger.warn(`[memory] Container đang dùng ${(memoryRatio * 100).toFixed(1)}% limit (${container.mib.toFixed(2)} MiB).`);
+  }
   const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
   const playtimeH = sessionStartTimestamp
     ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
     : null;
+  observability.sample({
+    ramMiB: container.mib,
+    cpu: Number(getCpuUsageDetail()),
+    heapMiB: Number((mem.heapUsed / 1_048_576).toFixed(2)),
+  });
 
   res.status(200).json({
     ok: true,
@@ -93,6 +113,10 @@ app.get('/health', (_req, res) => {
     errorCount,
     rateLimitCount,
     recentErrors,
+    presence: { category: currentPresenceCategory, durationMinutes: currentPresenceDurationMinutes },
+    observability: observability.summary(),
+    restGovernor: restGovernor.snapshot(),
+    lifecycle: { lastReadyAt, lastDisconnectAt, lastLoginStartedAt },
     container: {
       memory: container,
       cpu: getCpuUsageDetail(),
@@ -111,6 +135,12 @@ app.get('/health', (_req, res) => {
   });
 });
 
+app.get('/ready', (_req, res) => {
+  const officialReady = !officialBot || officialBot.client.isReady();
+  const ready = Boolean(discordReady && officialReady);
+  res.status(ready ? 200 : 503).json({ ready, discordReady, officialBotReady: officialReady });
+});
+
 // /status — trang HTML đọc được bằng mắt thường, mở trên browser
 app.get('/status', (_req, res) => {
   const uptimeH = ((Date.now() - processStartTime) / 3_600_000).toFixed(1);
@@ -121,6 +151,7 @@ app.get('/status', (_req, res) => {
   const container = getRealRenderRam();
   const heapMb = (mem.heapUsed / 1_048_576).toFixed(2);
   const cpuValue = getCpuUsageDetail();
+  observability.sample({ ramMiB: container.mib, cpu: Number(cpuValue), heapMiB: Number(heapMb) });
   const status = discordReady ? '🟢 Online' : '🔴 Offline';
 
   res.status(200).send(`<!DOCTYPE html>
@@ -144,6 +175,8 @@ app.get('/status', (_req, res) => {
 <div class="row"><span>CPU Usage</span><span>${cpuValue} / 0.1 CPU</span></div>
 <div class="row"><span>Heap JS</span><span class="${Number(heapMb) > 180 ? 'warn' : 'ok'}">${heapMb} MiB</span></div>
 <div class="row"><span>Errors</span><span class="${errorCount > 5 ? 'warn' : 'ok'}">${errorCount} (rate-limit: ${rateLimitCount})</span></div>
+<div class="row"><span>24h RAM min/avg/max</span><span>${observability.summary().ramMiB.min ?? '—'} / ${observability.summary().ramMiB.avg ?? '—'} / ${observability.summary().ramMiB.max ?? '—'} MiB</span></div>
+<div class="row"><span>24h CPU min/avg/max</span><span>${observability.summary().cpu.min ?? '—'} / ${observability.summary().cpu.avg ?? '—'} / ${observability.summary().cpu.max ?? '—'}</span></div>
 <div class="row"><span>Last activity</span><span>${lastActivity || '—'}</span></div>
 <div class="row"><span>Last presence</span><span>${lastPresenceUpdate || '—'}</span></div>
 <h2>Recent errors</h2>
@@ -155,7 +188,7 @@ app.get('/status', (_req, res) => {
 });
 
 app.listen(port, '0.0.0.0', () => {
-  logger.info(`Web is ready on port ${port}. Endpoints: / /ping /health /status`);
+  logger.info(`Web is ready on port ${port}. Endpoints: / /ping /health /ready /status`);
 });
 
 // ---------------------------------------------------------------------------
@@ -415,6 +448,8 @@ const DETAILS_POOL = [
   // placeholder — replaced at runtime by buildMatrixEntry()
 ];
 
+const presenceEngine = createPresenceEngine(DETAILS_POOL);
+
 function buildMatrixEntry() {
   return `🌊 Endstate Matrix — ${nextScore()} pts`;
 }
@@ -433,43 +468,27 @@ const STATES_POOL = [
   `${CFG.serverRegion} · UL${CFG.unionLevel} · S-Rank Grind`,
 ];
 
-let lastDetailsIdx = -1;
-let lastStateIdx   = -1;
-
-function pickRandom(pool, lastIdx) {
-  if (pool.length === 1) return { text: pool[0], idx: 0 };
-  let idx;
-  do { idx = Math.floor(Math.random() * pool.length); } while (idx === lastIdx);
-  return { text: pool[idx], idx };
-}
-
 let currentDetails = DETAILS_POOL[0];
 let currentState   = STATES_POOL[0];
+let currentPresenceCategory = presenceEngine.classify(currentDetails);
+let currentPresenceDurationMinutes = 10;
 
 // Rotate mỗi 10–20 phút — nhanh hơn một chút để trông tự nhiên hơn
 const ROTATE_MIN_MS = 10 * 60 * 1000;
 const ROTATE_MAX_MS = 20 * 60 * 1000;
 
 function scheduleDetailRotation(doSetPresence) {
-  const delay = ROTATE_MIN_MS + Math.floor(Math.random() * (ROTATE_MAX_MS - ROTATE_MIN_MS));
+  const next = presenceEngine.next();
   setTimeout(() => {
-    // 20% chance dùng Endstate Matrix với score mới
-    if (Math.random() < 0.20) {
-      currentDetails = buildMatrixEntry();
-      lastDetailsIdx = -1;
-    } else {
-      const d = pickRandom(DETAILS_POOL, lastDetailsIdx);
-      lastDetailsIdx = d.idx;
-      currentDetails = d.text;
-    }
-    const s = pickRandom(STATES_POOL, lastStateIdx);
-    lastStateIdx  = s.idx;
-    currentState  = s.text;
-
-    logger.info(`[presence] → "${currentDetails}" | "${currentState}"`);
+    currentDetails = Math.random() < 0.20 ? buildMatrixEntry() : next.text;
+    currentPresenceCategory = next.category;
+    currentPresenceDurationMinutes = next.durationMinutes;
+    const state = STATES_POOL[Math.floor(Math.random() * STATES_POOL.length)];
+    currentState = state;
+    logger.info(`[presence] category=${currentPresenceCategory} duration=${currentPresenceDurationMinutes}m → "${currentDetails}" | "${currentState}"`);
     doSetPresence();
     scheduleDetailRotation(doSetPresence);
-  }, delay);
+  }, next.nextDelayMs);
 }
 
 function isSupportedPresenceImage(v) {
@@ -536,6 +555,8 @@ let doSetPresence = null;   // giữ ref để resume sau reconnect
 
 client.on('ready', async () => {
   discordReady = true;
+  lastReadyAt = Date.now();
+  lastDisconnectAt = null;
   loginAttempt = 0;
   logger.info(`[discord] Đã đăng nhập tài khoản: ${client.user.tag} (id: ${client.user.id})`);
 
@@ -574,8 +595,10 @@ client.on('ready', async () => {
 // Reconnect sau mất kết nối — presence tự phục hồi qua ready event
 client.on('disconnect', () => {
   discordReady = false;
+  lastDisconnectAt = Date.now();
   // Dọn cache khi offline để tiết kiệm RAM trong lúc reconnect
   clearTransientCaches();
+  observability.recordReconnect();
   logger.warn('[discord] Mất kết nối — thư viện đang tự reconnect...');
 });
 
@@ -600,6 +623,7 @@ client.on('shardError', (error) => {
 // Rate limit — log nhưng không coi là error (Discord đang throttle, bình thường)
 client.on('rateLimit', (info) => {
   rateLimitCount++;
+  observability.recordRateLimit();
   logger.info(`[rateLimit] #${rateLimitCount} route=${info.route} timeout=${info.timeout}ms — Discord đang điều tiết, không phải lỗi ứng dụng.`);
 });
 
@@ -662,6 +686,7 @@ async function verifyUserToken(token) {
 }
 
 async function loginWithRetry() {
+  lastLoginStartedAt = Date.now();
   if (!RUN_DISCORD) {
     logger.info('[login] Bỏ qua Discord gateway: process này không chạy trên Render.');
     return;
@@ -766,7 +791,9 @@ function printStartupSummary() {
 // Cấu hình qua env: BOT_TOKEN, LOG_CHANNEL_ID, (tuỳ chọn) STATUS_URL, MONITOR_INTERVAL_MS
 // ---------------------------------------------------------------------------
 const BOT_TOKEN           = RUN_DISCORD ? process.env.BOT_TOKEN : null;
+const OFFICIAL_BOT_MODE   = process.env.OFFICIAL_BOT_MODE !== 'false';
 const LOG_CHANNEL_ID      = process.env.LOG_CHANNEL_ID;
+const restGovernor = new RestTrafficGovernor({ maxPerSecond: 4, burst: 2, maxFailures: 3, circuitMs: 60_000 });
 const MONITOR_INTERVAL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MONITOR_INTERVAL_MS) || 5 * 60 * 1000,
@@ -780,96 +807,28 @@ let statusMessageId    = null;   // message trạng thái được edit liên t�
 let monitorInFlight    = false;
 let monitorRateLimitedUntil = 0;
 
-class DiscordRateLimitError extends Error {
-  constructor(retryAfterMs, global = false) {
-    super(`Discord rate limit; retry after ${retryAfterMs}ms`);
-    this.name = 'DiscordRateLimitError';
-    this.retryAfterMs = retryAfterMs;
-    this.global = global;
-  }
-}
-
-let discordGlobalBlockedUntil = 0;
-
-function parseRetryAfterMs(headers, bodyText = '') {
-  const values = [
-    Number(headers.get('retry-after')) * 1000,
-    Number(headers.get('x-ratelimit-reset-after')) * 1000,
-  ];
-  try {
-    const body = JSON.parse(bodyText);
-    values.push(Number(body.retry_after) * 1000);
-  } catch (_) {}
-  const valid = values.filter((value) => Number.isFinite(value) && value > 0);
-  const fallback = isGlobalRateLimit(bodyText) ? 15 * 60 * 1000 : 60 * 1000;
-  return Math.max(1_000, Math.ceil(valid.length ? Math.max(...valid) : fallback));
-}
-
-function isGlobalRateLimit(bodyText = '') {
-  try {
-    const body = JSON.parse(bodyText);
-    if (body.global === true) return true;
-    return /blocked from accessing our API|global rate limit/i.test(String(body.message || ''));
-  } catch (_) {
-    return /blocked from accessing our API|global rate limit/i.test(bodyText);
-  }
-}
-
 function isDiscordRateLimitError(error) {
-  return error instanceof DiscordRateLimitError || error?.name === 'DiscordRateLimitError';
+  return error?.name === 'DiscordRateLimitError';
 }
 
 async function discordApi(pathSuffix, options = {}) {
-  const retryDelays = [2000, 5000, 15000];
+  const retryDelays = [2_000, 5_000, 15_000];
   for (let attempt = 0; ; attempt += 1) {
-    if (Date.now() < discordGlobalBlockedUntil) {
-      throw new DiscordRateLimitError(discordGlobalBlockedUntil - Date.now(), true);
-    }
-    const res = await fetch(`https://discord.com/api/v10${pathSuffix}`, {
-      ...options,
-      headers: {
-        Authorization: `Bot ${BOT_TOKEN}`,
-        'Content-Type': 'application/json',
-        ...(options.headers || {}),
-      },
-    });
+    const res = await restGovernor.request(
+      `https://discord.com/api/v10${pathSuffix}`,
+      { ...options, headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json', ...(options.headers || {}) } },
+      pathSuffix,
+    );
     if (res.ok) return res.status === 204 ? null : res.json();
-
     const text = await res.text().catch(() => '');
-    const retryable = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
-
-    if (res.status === 429) {
-      const global = isGlobalRateLimit(text);
-      const waitMs = parseRetryAfterMs(res.headers, text);
-      if (global) discordGlobalBlockedUntil = Math.max(discordGlobalBlockedUntil, Date.now() + waitMs);
-      logger.info(`[discord-api] Discord throttle ${pathSuffix} — tạm hoãn ${Math.ceil(waitMs / 1000)}s, không ghi là lỗi.`);
-      throw new DiscordRateLimitError(waitMs, global);
-    }
-
-    if (!retryable || attempt >= retryDelays.length) {
+    if (![502, 503, 504].includes(res.status) || attempt >= retryDelays.length) {
       throw new Error(`Discord API ${res.status}: ${text.slice(0, 300)}`);
     }
-
-    let waitMs = retryDelays[attempt];
-    const retryAfterHeader = Number(res.headers.get('retry-after')) * 1000;
-    const resetAfterHeader = Number(res.headers.get('x-ratelimit-reset-after')) * 1000;
-    if (Number.isFinite(retryAfterHeader) && retryAfterHeader > 0) {
-      waitMs = Math.min(retryAfterHeader, 60_000);
-    } else if (Number.isFinite(resetAfterHeader) && resetAfterHeader > 0) {
-      waitMs = Math.min(resetAfterHeader, 60_000);
-    }
-    try {
-      const body = JSON.parse(text);
-      const retryAfter = Number(body.retry_after) * 1000;
-      if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        waitMs = Math.min(retryAfter, 60_000);
-      }
-    } catch (_) {}
-    logger.info(`[discord-api] ${res.status} ${pathSuffix} — retry sau ${Math.ceil(waitMs / 1000)}s (${attempt + 1}/${retryDelays.length})`);
+    const waitMs = retryDelays[attempt];
+    logger.info(`[discord-api] ${res.status} ${pathSuffix} — retry sau ${Math.ceil(waitMs / 1000)}s`);
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // 👋 Chào mừng / Tạm biệt — tự ping khi có member vào hoặc rồi server.
@@ -890,7 +849,9 @@ const WELCOME_THROTTLE_MS  = Math.max(
   30 * 60 * 1000,
   Number(process.env.WELCOME_THROTTLE_MS) || 30 * 60 * 1000,
 ); // 30 phut
-const FAKE_MEMBER_OFFSET   = Number(process.env.FAKE_MEMBER_OFFSET) || 1280; // Bug mem ảo
+const FAKE_MEMBER_OFFSET   = Number(process.env.FAKE_MEMBER_OFFSET) || 0; // Mặc định hiển thị số member thật
+const DISABLE_WELCOME       = process.env.DISABLE_WELCOME === 'true';
+const DISABLE_GOODBYE       = process.env.DISABLE_GOODBYE === 'true';
 
 function getSpoofedMemberCount(guild) {
   const realCount = Number(guild?.memberCount) || 1;
@@ -937,6 +898,7 @@ let welcomeTimerRunning = false;
 
 function queueWelcomeEvent(type, member) {
   if (!BOT_TOKEN) return;
+  if ((type === 'join' && DISABLE_WELCOME) || (type === 'leave' && DISABLE_GOODBYE)) return;
   const memberId = String(member?.id || 'unknown');
   const duplicate = welcomeQueue.some((item) => item.type === type && String(item.member?.id || '') === memberId);
   if (duplicate) return;
@@ -961,15 +923,13 @@ async function processWelcomeQueue() {
       const item = welcomeQueue.shift();
       try {
         if (item.type === 'join' && WELCOME_CHANNEL_ID) {
-          await discordApi(`/channels/${WELCOME_CHANNEL_ID}/messages`, {
-            method: 'POST',
-            body: JSON.stringify({ embeds: [buildWelcomeEmbed(item.member)] }),
-          });
+          const embed = buildWelcomeEmbed(item.member);
+          if (officialBot) await officialBot.sendEmbed(WELCOME_CHANNEL_ID, embed);
+          else await discordApi(`/channels/${WELCOME_CHANNEL_ID}/messages`, { method: 'POST', body: JSON.stringify({ embeds: [embed] }) });
         } else if (item.type === 'leave' && GOODBYE_CHANNEL_ID) {
-          await discordApi(`/channels/${GOODBYE_CHANNEL_ID}/messages`, {
-            method: 'POST',
-            body: JSON.stringify({ embeds: [buildGoodbyeEmbed(item.member)] }),
-          });
+          const embed = buildGoodbyeEmbed(item.member);
+          if (officialBot) await officialBot.sendEmbed(GOODBYE_CHANNEL_ID, embed);
+          else await discordApi(`/channels/${GOODBYE_CHANNEL_ID}/messages`, { method: 'POST', body: JSON.stringify({ embeds: [embed] }) });
         }
         lastWelcomeSentAt = Date.now();
       } catch (e) {
@@ -990,17 +950,29 @@ async function processWelcomeQueue() {
   }
 }
 
-client.on('guildMemberAdd', (member) => {
+if (!OFFICIAL_BOT_MODE || !BOT_TOKEN) client.on('guildMemberAdd', (member) => {
   if (!BOT_TOKEN || !WELCOME_CHANNEL_ID) return;
   queueWelcomeEvent('join', member);
 });
 
-client.on('guildMemberRemove', (member) => {
+if (!OFFICIAL_BOT_MODE || !BOT_TOKEN) client.on('guildMemberRemove', (member) => {
   if (!BOT_TOKEN || !GOODBYE_CHANNEL_ID) return;
   queueWelcomeEvent('leave', member);
 });
 
-if (BOT_TOKEN && (WELCOME_CHANNEL_ID || GOODBYE_CHANNEL_ID)) {
+const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
+  ? createOfficialBot({
+      token: BOT_TOKEN,
+      logChannelId: LOG_CHANNEL_ID,
+      welcomeChannelId: DISABLE_WELCOME ? null : WELCOME_CHANNEL_ID,
+      goodbyeChannelId: DISABLE_GOODBYE ? null : GOODBYE_CHANNEL_ID,
+      onMemberJoin: (member) => queueWelcomeEvent('join', member),
+      onMemberLeave: (member) => queueWelcomeEvent('leave', member),
+      onError: (error) => { errorCount++; logger.error('[official-bot] Client error:', error.message); },
+    })
+  : null;
+
+if (BOT_TOKEN && !DISABLE_WELCOME && !DISABLE_GOODBYE && (WELCOME_CHANNEL_ID || GOODBYE_CHANNEL_ID)) {
   logger.info(`[welcome] Da bat ping chao mung / tam biet & bug mem ao (+${FAKE_MEMBER_OFFSET}) (toi da 1 tin moi ${Math.round(WELCOME_THROTTLE_MS / 60000)} phut).`);
 } else {
   logger.info('[welcome] Bỏ qua welcome/goodbye vì chưa cấu hình BOT_TOKEN hoặc channel.');
@@ -1011,17 +983,13 @@ processStartTime = uptimeStartTimestamp;
 logger.info(`[timer] Tiếp tục uptime — đã chạy ${((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1)}h (nguồn: starttime.json).`);
 
 function sendLogEmbed(embed) {
-  return discordApi(`/channels/${LOG_CHANNEL_ID}/messages`, {
-    method: 'POST',
-    body: JSON.stringify({ embeds: [embed] }),
-  });
+  if (officialBot) return officialBot.sendEmbed(LOG_CHANNEL_ID, embed);
+  return discordApi(`/channels/${LOG_CHANNEL_ID}/messages`, { method: 'POST', body: JSON.stringify({ embeds: [embed] }) });
 }
 
 function editLogEmbed(messageId, embed) {
-  return discordApi(`/channels/${LOG_CHANNEL_ID}/messages/${messageId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ embeds: [embed] }),
-  });
+  if (officialBot) return officialBot.editEmbed(LOG_CHANNEL_ID, messageId, embed);
+  return discordApi(`/channels/${LOG_CHANNEL_ID}/messages/${messageId}`, { method: 'PATCH', body: JSON.stringify({ embeds: [embed] }) });
 }
 
 // Embed đầy đủ thông tin — giống hệt các dòng hiển thị trên trang /status,
@@ -1151,6 +1119,11 @@ function buildStatusEmbed(health) {
         value: errorsCodeBlock,
         inline: false,
       },
+      {
+        name: '📈 24h Min / Avg / Max',
+        value: `RAM: ${health.observability?.ramMiB?.min ?? '—'} / ${health.observability?.ramMiB?.avg ?? '—'} / ${health.observability?.ramMiB?.max ?? '—'} MiB\nCPU: ${health.observability?.cpu?.min ?? '—'} / ${health.observability?.cpu?.avg ?? '—'} / ${health.observability?.cpu?.max ?? '—'}\nHeap: ${health.observability?.heapMiB?.min ?? '—'} / ${health.observability?.heapMiB?.avg ?? '—'} / ${health.observability?.heapMiB?.max ?? '—'} MiB\nReconnect: ${health.observability?.reconnects ?? 0} · Rate-limit: ${health.observability?.rateLimits ?? 0}`,
+        inline: false,
+      },
     ],
     footer: { text: `Render Free 24/7 · Cập nhật lúc ${ts}` },
   };
@@ -1175,10 +1148,15 @@ function buildFetchFailEmbed(errorMessage) {
 
 async function findExistingStatusMessage() {
   try {
-    const msgs = await discordApi(`/channels/${LOG_CHANNEL_ID}/messages?limit=10`);
-    if (Array.isArray(msgs)) {
-      const existing = msgs.find((m) => m.embeds?.[0]?.title?.includes('Wuthering Waves Bot'));
+    if (officialBot) {
+      const existing = await officialBot.findRecentEmbed(LOG_CHANNEL_ID, 'Wuthering Waves Bot');
       if (existing) return existing.id;
+    } else {
+      const msgs = await discordApi(`/channels/${LOG_CHANNEL_ID}/messages?limit=10`);
+      if (Array.isArray(msgs)) {
+        const existing = msgs.find((m) => m.embeds?.[0]?.title?.includes('Wuthering Waves Bot'));
+        if (existing) return existing.id;
+      }
     }
   } catch (e) {
     if (isDiscordRateLimitError(e)) {
@@ -1246,6 +1224,13 @@ async function runMonitorTick() {
 
 const DISABLE_MONITOR = process.env.DISABLE_MONITOR === 'true';
 
+if (officialBot) {
+  officialBot.login().then(() => logger.info('[official-bot] Bot chính thức đã kết nối Gateway.')).catch((error) => {
+    errorCount++;
+    logger.error('[official-bot] Login thất bại:', error.message);
+  });
+}
+
 if (BOT_TOKEN && LOG_CHANNEL_ID && !DISABLE_MONITOR) {
   logger.info(
     `[monitor] Log bot kích hoạt — ping mỗi ${MONITOR_INTERVAL_MS / 1000}s tới ${STATUS_URL} (bắt đầu sau 30s)`,
@@ -1257,8 +1242,16 @@ if (BOT_TOKEN && LOG_CHANNEL_ID && !DISABLE_MONITOR) {
 }
 
 // ---------------------------------------------------------------------------
+// Watchdog: không restart process, chỉ kích hoạt login retry nếu gateway offline quá lâu.
+const watchdogTimer = setInterval(() => {
+  if (RUN_DISCORD && !discordReady && Date.now() - lastLoginStartedAt > 10 * 60 * 1000) {
+    logger.info('[watchdog] Gateway offline quá 10 phút — kích hoạt reconnect an toàn.');
+    loginWithRetry();
+  }
+}, 5 * 60 * 1000);
+watchdogTimer.unref();
+
 // Startup
 // ---------------------------------------------------------------------------
-
 printStartupSummary();
 loginWithRetry();
