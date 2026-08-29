@@ -20,6 +20,12 @@ services:
         value: "0"
       - key: OFFICIAL_BOT_MODE
         value: "true"
+      - key: FULL_OFFICIAL_MODE
+        value: "false"
+      - key: STATUS_GIF_URL
+        sync: false
+      - key: EMBED_COLOR
+        value: "0x6d5dfc"
       - key: DISABLE_WELCOME
         value: "false"
       - key: DISABLE_GOODBYE

@@ -19,12 +19,19 @@ Wave 5 bật `OFFICIAL_BOT_MODE=true` trên Render. Bot chính thức dùng `dis
 | Biến | Giá trị gợi ý | Ý nghĩa |
 |---|---:|---|
 | `OFFICIAL_BOT_MODE` | `true` | Dùng bot chính thức cho REST/Gateway log và welcome |
+| `FULL_OFFICIAL_MODE` | `false` | `true` sẽ tắt hẳn selfbot runtime và chỉ chạy bot chính thức |
+| `STATUS_GIF_URL` | URL tùy chọn | GIF/CDN làm thumbnail; không tải file vào container |
+| `EMBED_COLOR` | `0x6d5dfc` | Màu theme tím Wuthering Waves |
 | `MONITOR_INTERVAL_MS` | `300000` | Monitor tối thiểu 5 phút/lần |
 | `WELCOME_THROTTLE_MS` | `1800000` | Tối thiểu 30 phút giữa các welcome/goodbye |
 | `FAKE_MEMBER_OFFSET` | `0` | Hiển thị member count thật |
 | `DISABLE_WELCOME` | `false` | Tắt riêng welcome khi cần |
 | `DISABLE_GOODBYE` | `false` | Tắt riêng goodbye khi cần |
 | `OBSERVABILITY_FILE` | `data/observability.json` | Nơi lưu snapshot 24 giờ |
+
+## Nguyên tắc tiết kiệm Render Free
+
+Bot không tải video/GIF về filesystem, không tạo worker riêng cho từng tính năng và không polling dưới 5 phút cho monitor. Timeline và snapshot đều có giới hạn số bản ghi, ghi atomic và tự prune theo cửa sổ 24 giờ. Storage ngoài chỉ được đọc một lần lúc boot và ghi tối đa mỗi 15 phút khi có `PERSISTENCE_URL`; nếu không cấu hình URL ngoài thì bot chỉ dùng local file nhẹ.
 
 ## Các Wave tiếp theo
 
@@ -36,7 +43,7 @@ Wave 8 là **Remote Configuration**, dùng file cấu hình có version và vali
 
 Wave 9 là **Storage Adapter**, hỗ trợ SQLite/S3/Redis hoặc dịch vụ key-value để snapshot 24 giờ sống qua redeploy Render thay vì chỉ lưu trên filesystem ephemeral.
 
-Wave 10 là **Full Official Mode**, loại bỏ hoàn toàn `discord.js-selfbot-v13` sau khi chấp nhận bot presence chính thức thay cho rich presence tài khoản người dùng.
+Wave 10 đã có cờ **Full Official Mode**. Đặt `FULL_OFFICIAL_MODE=true` để không đăng nhập selfbot, giảm cache selfbot và chạy log/welcome/presence bằng bot chính thức. Việc xóa dependency `discord.js-selfbot-v13` hoàn toàn là bước dọn cuối sau khi xác nhận không còn cần rich presence tài khoản người dùng.
 
 ## Tài liệu tham khảo
 

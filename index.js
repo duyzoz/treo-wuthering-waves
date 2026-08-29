@@ -6,6 +6,9 @@ const { createPresenceEngine } = require('./presence-engine');
 const { createObservability } = require('./observability');
 const { createOfficialBot } = require('./official-bot');
 const { RestTrafficGovernor } = require('./rest-governor');
+const { createIncidentTimeline } = require('./incident-timeline');
+const { createRemoteConfig } = require('./remote-config');
+const { createStorageAdapter } = require('./storage-adapter');
 
 const { Client, Options, RichPresence } = require('discord.js-selfbot-v13');
 
@@ -19,10 +22,14 @@ const CFG = {
   appId:          process.env.APP_ID           || '1243763782974443580',
   largeImg:       process.env.LARGE_IMG        || 'https://files.catbox.moe/6tly5b.png',
   smallImg:       process.env.SMALL_IMG        || 'https://i.pinimg.com/736x/19/37/44/1937447c2110ad986866d1495e6c4b30.jpg',
+  statusGif:      process.env.STATUS_GIF_URL    || '',
+  embedColor:     Number(process.env.EMBED_COLOR || 0x6d5dfc),
 };
 
-const RUN_DISCORD = process.env.ALLOW_DISCORD_RUN !== 'false';
-const DISCORD_TOKEN = process.env.TOKEN_DISCORD || process.env.TOKEN;
+const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
+const RUN_SELF_BOT = !FULL_OFFICIAL_MODE && process.env.ALLOW_DISCORD_RUN !== 'false';
+const RUN_DISCORD = RUN_SELF_BOT;
+const DISCORD_TOKEN = RUN_SELF_BOT ? (process.env.TOKEN_DISCORD || process.env.TOKEN) : null;
 
 // ---------------------------------------------------------------------------
 // Logging với timestamp — dễ debug trên Render
@@ -59,6 +66,13 @@ const port = Number(process.env.PORT) || 5000;
 const TIME_FILE = path.join(__dirname, 'starttime.json');
 const OBSERVABILITY_FILE = process.env.OBSERVABILITY_FILE || path.join(__dirname, 'data', 'observability.json');
 const observability = createObservability(OBSERVABILITY_FILE, { sampleEveryMs: 5 * 60 * 1000 });
+const timeline = createIncidentTimeline(process.env.INCIDENTS_FILE || path.join(__dirname, 'data', 'incidents.json'));
+const remoteConfig = createRemoteConfig(process.env.REMOTE_CONFIG_FILE || path.join(__dirname, 'data', 'remote-config.json'));
+const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
+let lastExternalPersistAt = 0;
+if (process.env.PERSISTENCE_URL) persistence.read().then((snapshot) => {
+  if (snapshot) logger.info('[storage] Đã đọc snapshot persistence ngoài một lần khi khởi động.');
+}).catch(() => {});
 
 let discordReady = false;
 let loginRetryTimer = null;
@@ -87,24 +101,31 @@ app.get('/', (_req, res) => {
 app.get('/health', (_req, res) => {
   const mem = process.memoryUsage();
   const container = getRealRenderRam();
-  const memoryRatio = container.limitBytes > 0 ? container.memoryBytes / container.limitBytes : 0;
+  const memoryRatio = container.limitBytes > 0 ? container.bytes / container.limitBytes : 0;
   if (memoryRatio >= 0.85 && Date.now() - lastMemoryWarningAt > 15 * 60 * 1000) {
     lastMemoryWarningAt = Date.now();
+    timeline.record('MEMORY_HIGH', `Container ${container.mib.toFixed(2)} MiB / ${(container.limitBytes / 1_048_576).toFixed(2)} MiB`);
     logger.warn(`[memory] Container đang dùng ${(memoryRatio * 100).toFixed(1)}% limit (${container.mib.toFixed(2)} MiB).`);
   }
   const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
-  const playtimeH = sessionStartTimestamp
-    ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
+  const playtimeStart = sessionStartTimestamp || getStartTimestamp();
+  const playtimeH = playtimeStart
+    ? ((Date.now() - playtimeStart) / 3_600_000).toFixed(1)
     : null;
   observability.sample({
     ramMiB: container.mib,
     cpu: Number(getCpuUsageDetail()),
     heapMiB: Number((mem.heapUsed / 1_048_576).toFixed(2)),
   });
+  if (process.env.PERSISTENCE_URL && Date.now() - lastExternalPersistAt >= 15 * 60 * 1000) {
+    lastExternalPersistAt = Date.now();
+    persistence.write({ savedAt: lastExternalPersistAt, uptimeSec, observability: observability.summary(), incidents: timeline.recent(50) }).catch(() => {});
+  }
 
   res.status(200).json({
     ok: true,
     discordReady,
+    officialBotReady: Boolean(officialBot?.client?.isReady?.()),
     sessionStartTimestamp,
     playtimeH,
     lastPresenceUpdate,
@@ -116,6 +137,8 @@ app.get('/health', (_req, res) => {
     presence: { category: currentPresenceCategory, durationMinutes: currentPresenceDurationMinutes },
     observability: observability.summary(),
     restGovernor: restGovernor.snapshot(),
+    incidents: timeline.recent(20),
+    remoteConfig: { version: remoteConfig.get().version, auditCount: remoteConfig.audit().length },
     lifecycle: { lastReadyAt, lastDisconnectAt, lastLoginStartedAt },
     container: {
       memory: container,
@@ -135,24 +158,28 @@ app.get('/health', (_req, res) => {
   });
 });
 
+app.get('/incidents', (_req, res) => res.status(200).json({ window: '24h', events: timeline.recent(50) }));
+
 app.get('/ready', (_req, res) => {
   const officialReady = !officialBot || officialBot.client.isReady();
-  const ready = Boolean(discordReady && officialReady);
+  const gatewayReady = FULL_OFFICIAL_MODE ? officialReady : discordReady;
+  const ready = Boolean(gatewayReady && officialReady);
   res.status(ready ? 200 : 503).json({ ready, discordReady, officialBotReady: officialReady });
 });
 
 // /status — trang HTML đọc được bằng mắt thường, mở trên browser
 app.get('/status', (_req, res) => {
   const uptimeH = ((Date.now() - processStartTime) / 3_600_000).toFixed(1);
-  const playtimeH = sessionStartTimestamp
-    ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
+  const playtimeStart = sessionStartTimestamp || getStartTimestamp();
+  const playtimeH = playtimeStart
+    ? ((Date.now() - playtimeStart) / 3_600_000).toFixed(1)
     : '—';
   const mem = process.memoryUsage();
   const container = getRealRenderRam();
   const heapMb = (mem.heapUsed / 1_048_576).toFixed(2);
   const cpuValue = getCpuUsageDetail();
   observability.sample({ ramMiB: container.mib, cpu: Number(cpuValue), heapMiB: Number(heapMb) });
-  const status = discordReady ? '🟢 Online' : '🔴 Offline';
+  const status = (discordReady || officialBot?.client?.isReady?.()) ? '🟢 Online' : '🔴 Offline';
 
   res.status(200).send(`<!DOCTYPE html>
 <html lang="vi">
@@ -188,7 +215,7 @@ app.get('/status', (_req, res) => {
 });
 
 app.listen(port, '0.0.0.0', () => {
-  logger.info(`Web is ready on port ${port}. Endpoints: / /ping /health /ready /status`);
+  logger.info(`Web is ready on port ${port}. Endpoints: / /ping /health /ready /incidents /status`);
 });
 
 // ---------------------------------------------------------------------------
@@ -198,10 +225,10 @@ const client = new Client({
   checkUpdate: false,
   makeCache: Options.cacheWithLimits({
     ...Options.defaultMakeCacheSettings,
-    MessageManager:     10,
+    MessageManager:     RUN_SELF_BOT ? 10 : 0,
     ReactionManager:     0,
-    UserManager:       500,
-    GuildMemberManager: 100,
+    UserManager:       RUN_SELF_BOT ? 500 : 0,
+    GuildMemberManager: RUN_SELF_BOT ? 100 : 0,
   }),
   sweepers: {
     ...Options.defaultSweeperSettings,
@@ -448,7 +475,11 @@ const DETAILS_POOL = [
   // placeholder — replaced at runtime by buildMatrixEntry()
 ];
 
-const presenceEngine = createPresenceEngine(DETAILS_POOL);
+const presenceRules = remoteConfig.get().presence;
+const presenceEngine = createPresenceEngine(DETAILS_POOL, {
+  minRotateMs: Math.max(10, Number(presenceRules.minRotateMinutes) || 10) * 60 * 1000,
+  maxRotateMs: Math.max(10, Number(presenceRules.maxRotateMinutes) || 20) * 60 * 1000,
+});
 
 function buildMatrixEntry() {
   return `🌊 Endstate Matrix — ${nextScore()} pts`;
@@ -557,6 +588,7 @@ client.on('ready', async () => {
   discordReady = true;
   lastReadyAt = Date.now();
   lastDisconnectAt = null;
+  timeline.record('DISCORD_READY', 'Selfbot Gateway ready');
   loginAttempt = 0;
   logger.info(`[discord] Đã đăng nhập tài khoản: ${client.user.tag} (id: ${client.user.id})`);
 
@@ -596,6 +628,7 @@ client.on('ready', async () => {
 client.on('disconnect', () => {
   discordReady = false;
   lastDisconnectAt = Date.now();
+  timeline.record('DISCORD_OFFLINE', 'Gateway disconnected');
   // Dọn cache khi offline để tiết kiệm RAM trong lúc reconnect
   clearTransientCaches();
   observability.recordReconnect();
@@ -624,6 +657,7 @@ client.on('shardError', (error) => {
 client.on('rateLimit', (info) => {
   rateLimitCount++;
   observability.recordRateLimit();
+  timeline.record('RATE_LIMIT', `Discord rate limit ${info?.route || 'gateway'}`);
   logger.info(`[rateLimit] #${rateLimitCount} route=${info.route} timeout=${info.timeout}ms — Discord đang điều tiết, không phải lỗi ứng dụng.`);
 });
 
@@ -661,12 +695,9 @@ process.on('SIGINT', () => {
 // ---------------------------------------------------------------------------
 async function verifyUserToken(token) {
   try {
-    const res = await fetch('https://discord.com/api/v9/users/@me', {
-      headers: {
-        Authorization: token,
-        'Content-Type': 'application/json',
-      },
-    });
+    const res = await restGovernor.request('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: token, 'Content-Type': 'application/json' },
+    }, '/users/@me');
     if (res.ok) {
       const user = await res.json();
       return { ok: true, user };
@@ -687,8 +718,8 @@ async function verifyUserToken(token) {
 
 async function loginWithRetry() {
   lastLoginStartedAt = Date.now();
-  if (!RUN_DISCORD) {
-    logger.info('[login] Bỏ qua Discord gateway: process này không chạy trên Render.');
+  if (!RUN_SELF_BOT) {
+    logger.info(`[login] Bỏ qua selfbot gateway${FULL_OFFICIAL_MODE ? '; Full Official Mode đang bật' : '; runtime Discord đang tắt'}.`);
     return;
   }
 
@@ -790,9 +821,12 @@ function printStartupSummary() {
 // - Có lỗi mới  -> gửi thêm 1 message mới kèm log lỗi để user copy.
 // Cấu hình qua env: BOT_TOKEN, LOG_CHANNEL_ID, (tuỳ chọn) STATUS_URL, MONITOR_INTERVAL_MS
 // ---------------------------------------------------------------------------
-const BOT_TOKEN           = RUN_DISCORD ? process.env.BOT_TOKEN : null;
-const OFFICIAL_BOT_MODE   = process.env.OFFICIAL_BOT_MODE !== 'false';
-const LOG_CHANNEL_ID      = process.env.LOG_CHANNEL_ID;
+const BOT_TOKEN           = process.env.BOT_TOKEN || null;
+const REMOTE_FEATURES     = remoteConfig.get().features;
+const OFFICIAL_BOT_MODE   = process.env.OFFICIAL_BOT_MODE !== 'false' && REMOTE_FEATURES.officialBot !== false;
+const REMOTE_CHANNELS     = remoteConfig.get().channels;
+const LOG_CHANNEL_ID      = process.env.LOG_CHANNEL_ID || REMOTE_CHANNELS.log;
+
 const restGovernor = new RestTrafficGovernor({ maxPerSecond: 4, burst: 2, maxFailures: 3, circuitMs: 60_000 });
 const MONITOR_INTERVAL_MS = Math.max(
   5 * 60 * 1000,
@@ -843,15 +877,15 @@ async function discordApi(pathSuffix, options = {}) {
 //      GOODBYE_CHANNEL_ID (điền sau khi chạy apply tạo kênh tạm-biệt xong),
 //      WELCOME_THROTTLE_MS (mặc định 1800000 = 30 phút).
 // ---------------------------------------------------------------------------
-const WELCOME_CHANNEL_ID   = process.env.WELCOME_CHANNEL_ID || '1484731010448097520';
-const GOODBYE_CHANNEL_ID   = process.env.GOODBYE_CHANNEL_ID || process.env.WELCOME_CHANNEL_ID || '1484731010448097520';
+const WELCOME_CHANNEL_ID   = process.env.WELCOME_CHANNEL_ID || REMOTE_CHANNELS.welcome || '1484731010448097520';
+const GOODBYE_CHANNEL_ID   = process.env.GOODBYE_CHANNEL_ID || process.env.WELCOME_CHANNEL_ID || REMOTE_CHANNELS.goodbye || '1484731010448097520';
 const WELCOME_THROTTLE_MS  = Math.max(
   30 * 60 * 1000,
   Number(process.env.WELCOME_THROTTLE_MS) || 30 * 60 * 1000,
 ); // 30 phut
 const FAKE_MEMBER_OFFSET   = Number(process.env.FAKE_MEMBER_OFFSET) || 0; // Mặc định hiển thị số member thật
-const DISABLE_WELCOME       = process.env.DISABLE_WELCOME === 'true';
-const DISABLE_GOODBYE       = process.env.DISABLE_GOODBYE === 'true';
+const DISABLE_WELCOME       = process.env.DISABLE_WELCOME === 'true' || REMOTE_FEATURES.welcome === false;
+const DISABLE_GOODBYE       = process.env.DISABLE_GOODBYE === 'true' || REMOTE_FEATURES.goodbye === false;
 
 function getSpoofedMemberCount(guild) {
   const realCount = Number(guild?.memberCount) || 1;
@@ -1065,7 +1099,11 @@ function getRealRenderRam() {
 function formatMiB(value) {
   return Number(value).toFixed(2);
 }
-
+function progressBar(ratio, width = 10) {
+  const safe = Math.max(0, Math.min(1, Number(ratio) || 0));
+  const filled = Math.round(safe * width);
+  return '▰'.repeat(filled) + '▱'.repeat(width - filled);
+}
 function buildStatusEmbed(health) {
   const cfg = health.config || health.cfg || {};
   const uptimeH = uptimeStartTimestamp
@@ -1097,21 +1135,23 @@ function buildStatusEmbed(health) {
 
   const realRam = getRealRenderRam();
   const realHeapMb = process.memoryUsage().heapUsed / 1_048_576;
-  const cpuVal = getCpuUsageDetail();
-
+    const cpuVal = getCpuUsageDetail();
+  const ramRatio = realRam.limitBytes > 0 ? realRam.bytes / realRam.limitBytes : 0;
   return {
     title: '🛡️ All-In-One System & Log Manager',
-    color: hasErrors ? 0xff6b6b : 0x2ec27e,
-    description: '📊 Bảng theo dõi trạng thái hệ thống và Log lỗi trực tiếp.',
+    color: hasErrors ? 0xff6b6b : CFG.embedColor,
+    description: '🌌 Wuthering Waves · Live Operations Console\n📊 Theo dõi trạng thái, tài nguyên và incident trực tiếp.',
+    author: { name: 'WW Status Logger · Render 24/7', icon_url: CFG.smallImg },
+    thumbnail: CFG.statusGif ? { url: CFG.statusGif } : undefined,
     fields: [
       {
         name: '🎮 Selfbot Treo Game',
-        value: `${health.discordReady ? '🟢 Online' : '🔴 Offline'} · **${playtimeH}h** playtime\n${cfg.resonatorName ?? 'Hiyuki S6'} | ${cfg.serverRegion ?? 'Asia'} UL${cfg.unionLevel ?? '80'}`,
+        value: `${(health.discordReady || health.officialBotReady) ? '🟢 Online' : '🔴 Offline'} · **${playtimeH}h** playtime\n${cfg.resonatorName ?? 'Hiyuki S6'} | ${cfg.serverRegion ?? 'Asia'} UL${cfg.unionLevel ?? '80'}\n🏷️ Presence: **${health.presence?.category ?? 'farming'}** · ⏱️ ${health.presence?.durationMinutes ?? '—'}m`,
         inline: true,
       },
       {
         name: '💾 Bộ Nhớ & Tài Nguyên (Render 24/7)',
-        value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${formatMiB(realHeapMb)} MiB**\nUptime: **${uptimeH}h**`,
+        value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\n${progressBar(ramRatio)} ${(ramRatio * 100).toFixed(1)}%\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${formatMiB(realHeapMb)} MiB**\nUptime: **${uptimeH}h**`,
         inline: true,
       },
       {
@@ -1244,7 +1284,7 @@ if (BOT_TOKEN && LOG_CHANNEL_ID && !DISABLE_MONITOR) {
 // ---------------------------------------------------------------------------
 // Watchdog: không restart process, chỉ kích hoạt login retry nếu gateway offline quá lâu.
 const watchdogTimer = setInterval(() => {
-  if (RUN_DISCORD && !discordReady && Date.now() - lastLoginStartedAt > 10 * 60 * 1000) {
+  if (RUN_SELF_BOT && !discordReady && Date.now() - lastLoginStartedAt > 10 * 60 * 1000) {
     logger.info('[watchdog] Gateway offline quá 10 phút — kích hoạt reconnect an toàn.');
     loginWithRetry();
   }
