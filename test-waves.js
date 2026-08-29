@@ -12,6 +12,7 @@ const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require(
 const { createConfigBackup } = require('./config-backup');
 const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
 const { healthScore, trend, isMaintenanceWindowActive } = require('./dashboard-metrics');
+const { createSafeCleanup } = require('./safe-cleanup');
 
 (async () => {
   const engine = createPresenceEngine(['⚔️ Hunting: Dreamless', '🗼 Tower of Adversity — Floor 10'], { minRotateMs: 1, maxRotateMs: 1 });
@@ -50,9 +51,11 @@ const { healthScore, trend, isMaintenanceWindowActive } = require('./dashboard-m
   assert.equal(trend(10, 12), '↓');
   assert.equal(healthScore({ discordReady: true, officialBotReady: true, container: { memory: { bytes: 100, limitBytes: 1000 } }, errorCount: 0, rateLimitCount: 0 }).level, 'EXCELLENT');
   assert.equal(isMaintenanceWindowActive(new Date('2026-08-29T03:00:00+07:00'), '02:00', '05:00'), true);
+  const cleanupDir = path.join(dir, 'data', 'tmp'); fs.mkdirSync(cleanupDir, { recursive: true }); fs.writeFileSync(path.join(cleanupDir, 'old.tmp'), 'old'); fs.writeFileSync(path.join(cleanupDir, 'keep.json'), '{}'); const oldTime = Date.now() - 2 * 24 * 60 * 60 * 1000; fs.utimesSync(path.join(cleanupDir, 'old.tmp'), oldTime / 1000, oldTime / 1000);
+  const cleanup = createSafeCleanup({ rootDir: cleanupDir, maxAgeMs: 24 * 60 * 60 * 1000 }); assert.equal(cleanup.run(Date.now()).removed, 1); assert.equal(fs.existsSync(path.join(cleanupDir, 'keep.json')), true);
 
   let calls = 0; const governor = new RestTrafficGovernor({ maxPerSecond: 1000, burst: 1, fetchImpl: async () => { calls += 1; return new Response(JSON.stringify({ retry_after: 0.01, global: true }), { status: 429, headers: { 'content-type': 'application/json', 'x-ratelimit-global': 'true' } }); } });
   await governor.request('https://discord.test/api', {}, '/test').then(() => assert.fail('expected rate limit')).catch((error) => { assert.equal(error.name, 'DiscordRateLimitError'); assert.equal(error.global, true); });
   assert.equal(calls, 1); assert.ok(governor.snapshot().globalBlockedUntil > Date.now());
-  console.log('wave 21-30 regression tests: ok');
+  console.log('safe cleanup regression tests: ok');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

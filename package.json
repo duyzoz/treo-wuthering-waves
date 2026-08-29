@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node index.js",
     "start:gc": "node --expose-gc index.js",
-    "test": "node --check index.js && node --check official-bot.js && node --check observability.js && node --check presence-engine.js && node --check rest-governor.js && node --check incident-timeline.js && node --check remote-config.js && node --check storage-adapter.js && node --check ops-guard.js && node --check config-backup.js && node --check resource-governor.js && node --check dashboard-metrics.js && node test-waves.js"
+    "test": "node --check index.js && node --check official-bot.js && node --check observability.js && node --check presence-engine.js && node --check rest-governor.js && node --check incident-timeline.js && node --check remote-config.js && node --check storage-adapter.js && node --check ops-guard.js && node --check config-backup.js && node --check resource-governor.js && node --check dashboard-metrics.js && node --check safe-cleanup.js && node test-waves.js"
   },
   "dependencies": {
     "discord.js": "^14.27.0",

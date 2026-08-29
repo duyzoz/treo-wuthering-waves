@@ -13,6 +13,7 @@ const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require(
 const { createConfigBackup } = require('./config-backup');
 const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
 const { healthScore, trend, budgetHud, isMaintenanceWindowActive } = require('./dashboard-metrics');
+const { createSafeCleanup } = require('./safe-cleanup');
 
 const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
 const selfbotLib = FULL_OFFICIAL_MODE
@@ -83,6 +84,7 @@ const existingConfigBackup = configBackup.list()[0];
 if (!existingConfigBackup || existingConfigBackup.checksum !== configBackup.checksum(remoteConfig.get())) configBackup.backup(remoteConfig.get());
 let maintenanceMode = false;
 const trendHistory = [];
+const safeCleanup = createSafeCleanup({ rootDir: path.join(__dirname, 'data', 'tmp') });
 const ADMIN_CONFIG_KEY = process.env.ADMIN_CONFIG_KEY || '';
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
@@ -157,6 +159,7 @@ app.get('/health', (_req, res) => {
     anomalyGuard: anomalyGuard.snapshot(),
     resourceBudget: resourceGovernor.snapshot(),
     budgetHud: budgetHud(resourceGovernor.snapshot()),
+    cleanup: safeCleanup.snapshot(),
     maintenanceMode,
     maintenanceWindow: { active: isMaintenanceWindowActive(), start: process.env.MAINTENANCE_START || null, end: process.env.MAINTENANCE_END || null },
     healthScore: healthScore({ discordReady, officialBotReady: Boolean(officialBot?.client?.isReady?.()), container: { memory: container }, rateLimitCount, errorCount }),
@@ -339,6 +342,8 @@ errorDecayTimer.unref();
 const heartbeatTimer = setInterval(() => {
   const uptimeH = ((Date.now() - processStartTime) / 3_600_000).toFixed(1);
   const { heapUsed, rss } = process.memoryUsage();
+  const cleanup = safeCleanup.run();
+  if (cleanup.removed > 0) logger.info(`[cleanup] Đã dọn ${cleanup.removed} file tạm (${Math.round(cleanup.bytes / 1024)} KiB).`);
   logger.info(`[heartbeat] uptime=${uptimeH}h discord=${discordReady} heap=${Math.round(heapUsed/1024/1024)}MB rss=${Math.round(rss/1024/1024)}MB`);
 }, HEARTBEAT_MS);
 heartbeatTimer.unref();
