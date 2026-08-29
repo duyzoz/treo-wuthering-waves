@@ -11,6 +11,7 @@ const { createStorageAdapter } = require('./storage-adapter');
 const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require('./ops-guard');
 const { createConfigBackup } = require('./config-backup');
 const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
+const { healthScore, trend, isMaintenanceWindowActive } = require('./dashboard-metrics');
 
 (async () => {
   const engine = createPresenceEngine(['⚔️ Hunting: Dreamless', '🗼 Tower of Adversity — Floor 10'], { minRotateMs: 1, maxRotateMs: 1 });
@@ -45,9 +46,13 @@ const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-govern
   assert.equal(budget.consume('request'), false, 'budget third request blocked');
   assert.equal(budget.snapshot().mode, 'health-only', 'budget health-only mode');
   assert.equal(nextAdaptiveDelay({ baseMs: 300000, health: { container: { memory: { bytes: 900, limitBytes: 1000 } } } }), 900000, 'adaptive delay');
+  assert.equal(trend(12, 10), '↑');
+  assert.equal(trend(10, 12), '↓');
+  assert.equal(healthScore({ discordReady: true, officialBotReady: true, container: { memory: { bytes: 100, limitBytes: 1000 } }, errorCount: 0, rateLimitCount: 0 }).level, 'EXCELLENT');
+  assert.equal(isMaintenanceWindowActive(new Date('2026-08-29T03:00:00+07:00'), '02:00', '05:00'), true);
 
   let calls = 0; const governor = new RestTrafficGovernor({ maxPerSecond: 1000, burst: 1, fetchImpl: async () => { calls += 1; return new Response(JSON.stringify({ retry_after: 0.01, global: true }), { status: 429, headers: { 'content-type': 'application/json', 'x-ratelimit-global': 'true' } }); } });
   await governor.request('https://discord.test/api', {}, '/test').then(() => assert.fail('expected rate limit')).catch((error) => { assert.equal(error.name, 'DiscordRateLimitError'); assert.equal(error.global, true); });
   assert.equal(calls, 1); assert.ok(governor.snapshot().globalBlockedUntil > Date.now());
-  console.log('wave 16-20 regression tests: ok');
+  console.log('wave 21-30 regression tests: ok');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

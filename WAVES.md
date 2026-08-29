@@ -70,6 +70,22 @@ Wave 19 cung cấp `GET /admin/config`, `POST /admin/config` và `POST /admin/co
 
 Wave 20 có blueprint `render-official.yaml`. Profile này dùng `package.official.json`, chỉ cài `discord.js` chính thức và `express`, chạy `FULL_OFFICIAL_MODE=true`, không nạp package selfbot. Profile hiện tại `render.yaml` vẫn giữ rich presence legacy để không thay đổi hành vi tài khoản đang dùng.
 
+## Wave 21–30
+
+Wave 21 dùng Compact Embed V2: health score, trend arrows và budget HUD được đưa vào embed hiện có, không tạo message mới.
+
+Wave 22 dùng persona presence theo nhóm `Rover`, `Boss Hunter`, `Tower Climber`, `Explorer` và `Waveplate Farmer`; nội dung chỉ thay trong vòng rotate hiện tại.
+
+Wave 23 tính Health Score từ Gateway, RAM, CPU, reconnect, rate-limit và lỗi ứng dụng. Wave 24 giữ tối đa 12 điểm trend trong RAM để hiển thị `↑`, `↓` hoặc `→`, không dùng thư viện chart.
+
+Wave 25 chỉ edit status embed khi fingerprint quan trọng thay đổi hoặc đã quá 30 phút. Wave 26 tiếp tục dùng `STATUS_GIF_URL` từ CDN, không tải asset vào container.
+
+Wave 27 dùng backoff reconnect và không restart process trong loop. Wave 28 hiển thị budget request/update/I/O trực tiếp trong health và embed.
+
+Wave 29 cung cấp `/public` dạng HTML inline, tự refresh 60 giây, không lộ secret. Wave 30 dùng `MAINTENANCE_START`/`MAINTENANCE_END` theo timezone `NIGHT_SAVER_TZ`; trong cửa sổ này chỉ giữ health/ping.
+
+Profile chính thức tách riêng ở `render-official.yaml`. Các biến `MAX_REQUESTS_PER_DAY`, `MAX_DISCORD_UPDATES_PER_DAY`, `MAX_IO_PER_DAY` có thể giảm thêm nếu muốn ưu tiên tuổi thọ Render Free.
+
 ## Tài liệu tham khảo
 
 Discord rate limits: <https://docs.discord.com/developers/topics/rate-limits>

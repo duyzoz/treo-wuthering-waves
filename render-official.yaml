@@ -38,3 +38,7 @@ services:
         value: "data/observability.json"
       - key: MONITOR_INTERVAL_MS
         value: "300000"
+      - key: MAINTENANCE_START
+        value: ""
+      - key: MAINTENANCE_END
+        value: ""

@@ -56,6 +56,10 @@ services:
         value: "300000"
       - key: DISABLE_MONITOR
         value: "false"
+      - key: MAINTENANCE_START
+        value: ""
+      - key: MAINTENANCE_END
+        value: ""
       - key: WELCOME_THROTTLE_MS
         value: "1800000"
       - key: UPTIME_START_TIMESTAMP

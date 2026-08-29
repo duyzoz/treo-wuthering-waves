@@ -12,6 +12,7 @@ const { createStorageAdapter } = require('./storage-adapter');
 const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require('./ops-guard');
 const { createConfigBackup } = require('./config-backup');
 const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
+const { healthScore, trend, budgetHud, isMaintenanceWindowActive } = require('./dashboard-metrics');
 
 const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
 const selfbotLib = FULL_OFFICIAL_MODE
@@ -81,6 +82,7 @@ const configBackup = createConfigBackup(process.env.REMOTE_CONFIG_FILE || path.j
 const existingConfigBackup = configBackup.list()[0];
 if (!existingConfigBackup || existingConfigBackup.checksum !== configBackup.checksum(remoteConfig.get())) configBackup.backup(remoteConfig.get());
 let maintenanceMode = false;
+const trendHistory = [];
 const ADMIN_CONFIG_KEY = process.env.ADMIN_CONFIG_KEY || '';
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
@@ -131,6 +133,8 @@ app.get('/health', (_req, res) => {
     cpu: Number(getCpuUsageDetail()),
     heapMiB: Number((mem.heapUsed / 1_048_576).toFixed(2)),
   });
+  trendHistory.push({ ts: Date.now(), ram: container.mib, cpu: Number(getCpuUsageDetail()), heap: mem.heapUsed / 1_048_576 });
+  if (trendHistory.length > 12) trendHistory.shift();
   if (process.env.PERSISTENCE_URL && Date.now() - lastExternalPersistAt >= 15 * 60 * 1000) {
     lastExternalPersistAt = Date.now();
     persistence.write({ savedAt: lastExternalPersistAt, uptimeSec, observability: observability.summary(), incidents: timeline.recent(50) }).catch(() => {});
@@ -152,7 +156,11 @@ app.get('/health', (_req, res) => {
     nightSaver: { active: isNightSaverActive(), start: process.env.NIGHT_SAVER_START || '23:00', end: process.env.NIGHT_SAVER_END || '07:00', timezone: process.env.NIGHT_SAVER_TZ || 'Asia/Ho_Chi_Minh' },
     anomalyGuard: anomalyGuard.snapshot(),
     resourceBudget: resourceGovernor.snapshot(),
+    budgetHud: budgetHud(resourceGovernor.snapshot()),
     maintenanceMode,
+    maintenanceWindow: { active: isMaintenanceWindowActive(), start: process.env.MAINTENANCE_START || null, end: process.env.MAINTENANCE_END || null },
+    healthScore: healthScore({ discordReady, officialBotReady: Boolean(officialBot?.client?.isReady?.()), container: { memory: container }, rateLimitCount, errorCount }),
+    trends: { ram: trend(container.mib, trendHistory.at(-2)?.ram), cpu: trend(Number(getCpuUsageDetail()), trendHistory.at(-2)?.cpu), heap: trend(mem.heapUsed / 1_048_576, trendHistory.at(-2)?.heap) },
     observability: observability.summary(),
     restGovernor: restGovernor.snapshot(),
     incidents: timeline.recent(20),
@@ -190,8 +198,9 @@ app.get('/public', (_req, res) => {
   const officialReady = Boolean(officialBot?.client?.isReady?.());
   const online = Boolean(discordReady || officialReady);
   const digest = buildIncidentDigest(timeline.recent(50));
+  const score = healthScore({ discordReady, officialBotReady: officialReady, container: { memory }, errorCount, rateLimitCount });
   const uptimeH = ((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1);
-  res.type('html').send(`<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>WW Status</title><style>body{margin:0;background:#0b1020;color:#e9e7ff;font:14px system-ui;padding:24px}main{max-width:620px;margin:auto;background:linear-gradient(145deg,#17163b,#0d2942);border:1px solid #6657d9;border-radius:18px;padding:20px;box-shadow:0 12px 40px #0008}h1{margin:0 0 14px;color:#b8b2ff}.badge{display:inline-block;padding:6px 10px;border-radius:99px;background:${online ? '#153e31' : '#4a1f34'};color:${online ? '#6fffd2' : '#ff8ba7'}}.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #ffffff18}.bar{height:8px;background:#242750;border-radius:8px;overflow:hidden}.bar i{display:block;height:100%;width:${Math.min(100, Math.max(0, ratio * 100)).toFixed(1)}%;background:linear-gradient(90deg,#57d6ff,#9d6bff)}</style><main><h1>🌊 Wuthering Waves</h1><span class="badge">${online ? 'ONLINE' : 'OFFLINE'}</span><div class="row"><span>Uptime</span><b>${uptimeH}h</b></div><div class="row"><span>Memory</span><b>${memory.mib.toFixed(2)} / ${(memory.limitBytes / 1048576).toFixed(0)} MiB</b></div><div class="bar"><i></i></div><div class="row"><span>CPU</span><b>${getCpuUsageDetail()}</b></div><div class="row"><span>Incidents</span><b>${digest.icon} ${digest.level}</b></div><small>Updated ${new Date().toISOString()}</small></main>`);
+  res.type('html').send(`<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>WW Status</title><style>body{margin:0;background:#0b1020;color:#e9e7ff;font:14px system-ui;padding:24px}main{max-width:620px;margin:auto;background:linear-gradient(145deg,#17163b,#0d2942);border:1px solid #6657d9;border-radius:18px;padding:20px;box-shadow:0 12px 40px #0008}h1{margin:0 0 14px;color:#b8b2ff}.badge{display:inline-block;padding:6px 10px;border-radius:99px;background:${online ? '#153e31' : '#4a1f34'};color:${online ? '#6fffd2' : '#ff8ba7'}}.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #ffffff18}.bar{height:8px;background:#242750;border-radius:8px;overflow:hidden}.bar i{display:block;height:100%;width:${Math.min(100, Math.max(0, ratio * 100)).toFixed(1)}%;background:linear-gradient(90deg,#57d6ff,#9d6bff)}</style><main><h1>🌊 Wuthering Waves</h1><span class="badge">${online ? 'ONLINE' : 'OFFLINE'}</span><div class="row"><span>Uptime</span><b>${uptimeH}h</b></div><div class="row"><span>Memory</span><b>${memory.mib.toFixed(2)} / ${(memory.limitBytes / 1048576).toFixed(0)} MiB</b></div><div class="bar"><i></i></div><div class="row"><span>CPU</span><b>${getCpuUsageDetail()}</b></div><div class="row"><span>Health</span><b>${score.score}/100 · ${score.level}</b></div><div class="row"><span>Incidents</span><b>${digest.icon} ${digest.level}</b></div><small>Updated ${new Date().toISOString()}</small></main>`);
 });
 app.get('/admin/config', (req, res) => {
   if (!isAdminRequest(req)) return res.status(401).json({ error: 'Admin key required' });
@@ -1234,7 +1243,7 @@ function buildStatusEmbed(health) {
   return {
     title: '🛡️ All-In-One System & Log Manager',
     color: hasErrors ? 0xff6b6b : CFG.embedColor,
-    description: '🌌 Wuthering Waves · Live Operations Console\n📊 Theo dõi trạng thái, tài nguyên và incident trực tiếp.',
+    description: `🌌 Wuthering Waves · Live Operations Console\n📊 Theo dõi trạng thái, tài nguyên và incident trực tiếp.\n💠 Health Score: **${health.healthScore?.score ?? '—'}/100 · ${health.healthScore?.level ?? 'UNKNOWN'}**`,
     author: { name: 'WW Status Logger · Render 24/7', icon_url: CFG.smallImg },
     thumbnail: CFG.statusGif ? { url: CFG.statusGif } : undefined,
     fields: [
@@ -1245,12 +1254,12 @@ function buildStatusEmbed(health) {
       },
       {
         name: '💾 Bộ Nhớ & Tài Nguyên (Render 24/7)',
-        value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\n${progressBar(ramRatio)} ${(ramRatio * 100).toFixed(1)}%\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${formatMiB(realHeapMb)} MiB**\nUptime: **${uptimeH}h**`,
+        value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\n${progressBar(ramRatio)} ${(ramRatio * 100).toFixed(1)}% ${health.trends?.ram ?? '→'}\nCPU Usage: **${cpuVal}** / 0.1 CPU ${health.trends?.cpu ?? '→'}\nHeap JS: **${formatMiB(realHeapMb)} MiB** ${health.trends?.heap ?? '→'}\nUptime: **${uptimeH}h**\n📦 Budget: ${health.budgetHud ?? '—'}`,
         inline: true,
       },
       {
         name: `${digest.icon} Incident Digest · ${digest.level}`,
-        value: `${digest.text}\n${isNightSaverActive() ? '🌙 Night Saver đang hoạt động · REST giảm tải' : '☀️ Chế độ thường · monitor theo lịch'}\n${digest.events.slice(-5).map((e) => `${e.code} · ${e.message}`).join('\n') || 'Không có incident mới trong 30 phút.'}`,
+        value: `${digest.text}\n${health.maintenanceMode ? '🛠️ Maintenance · chỉ health/ping' : isNightSaverActive() ? '🌙 Night Saver đang hoạt động · REST giảm tải' : '☀️ Chế độ thường · monitor theo lịch'}\n${digest.events.slice(-5).map((e) => `${e.code} · ${e.message}`).join('\n') || 'Không có incident mới trong 30 phút.'}`,
         inline: false,
       },
       {
@@ -1341,8 +1350,10 @@ async function pushStatusEmbed(embed) {
 }
 
 let consecutiveHealthyMonitorTicks = 0;
+let lastStatusFingerprint = '';
+let lastStatusEditAt = 0;
 async function runMonitorTick() {
-  if (monitorInFlight || maintenanceMode || Date.now() < monitorRateLimitedUntil) return { skipped: true };
+  if (monitorInFlight || maintenanceMode || isMaintenanceWindowActive() || Date.now() < monitorRateLimitedUntil) return { skipped: true };
   if (officialBot && !officialBot.client.isReady()) return { skipped: true, nextDelay: MONITOR_INTERVAL_MS };
   if (!resourceGovernor.consume('request')) {
     timeline.record('BUDGET_HEALTH_ONLY', 'Đạt ngân sách request/ngày; chỉ giữ health/ping');
@@ -1358,10 +1369,15 @@ async function runMonitorTick() {
       timeline.record(anomaly.code, anomaly.reasons.join(' · '), { severity: anomaly.severity });
       health.incidents = timeline.recent(50);
     }
-    if (resourceGovernor.can('discordUpdate')) {
+    const statusFingerprint = JSON.stringify({ ready: health.discordReady || health.officialBotReady, score: health.healthScore?.score, presence: health.presence?.category, ram: Math.round(Number(health.container?.memory?.mib || 0)), incident: buildIncidentDigest(health.incidents || []).level, budget: health.resourceBudget?.mode });
+    const changed = statusFingerprint !== lastStatusFingerprint;
+    const due = Date.now() - lastStatusEditAt >= 30 * 60 * 1000;
+    if (resourceGovernor.can('discordUpdate') && (changed || due)) {
       await pushStatusEmbed(buildStatusEmbed(health));
+      lastStatusFingerprint = statusFingerprint;
+      lastStatusEditAt = Date.now();
       resourceGovernor.consume('discordUpdate');
-    } else {
+    } else if (!resourceGovernor.can('discordUpdate')) {
       timeline.record('BUDGET_HEALTH_ONLY', 'Đã chạm ngân sách Discord update; bỏ qua edit embed');
     }
     consecutiveHealthyMonitorTicks += 1;
