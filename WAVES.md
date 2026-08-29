@@ -45,6 +45,18 @@ Wave 9 là **Storage Adapter**, hỗ trợ SQLite/S3/Redis hoặc dịch vụ ke
 
 Wave 10 đã có cờ **Full Official Mode**. Đặt `FULL_OFFICIAL_MODE=true` để không đăng nhập selfbot, giảm cache selfbot và chạy log/welcome/presence bằng bot chính thức. Việc xóa dependency `discord.js-selfbot-v13` hoàn toàn là bước dọn cuối sau khi xác nhận không còn cần rich presence tài khoản người dùng.
 
+## Wave 11–15 và cấu hình tiết kiệm
+
+Wave 11 dùng `NIGHT_SAVER_ENABLED=true`, `NIGHT_SAVER_START=23:00`, `NIGHT_SAVER_END=07:00` và `NIGHT_SAVER_TZ=Asia/Ho_Chi_Minh`. Trong khung giờ này presence không rotate, welcome/goodbye bị tạm dừng và monitor không gửi status update; `/health` và `/ping` vẫn hoạt động để Render/UptimeRobot không restart nhầm.
+
+Wave 12 chạy ngay trong monitor tick hiện có, không tạo timer mới. Guard cảnh báo khi RAM đạt 85%, CPU cao, reconnect lặp hoặc rate-limit lặp; cooldown mặc định 30 phút.
+
+Wave 13 hiển thị một Compact Incident Digest trong status embed, gom event 30 phút thành `OK`, `WARN` hoặc `CRITICAL`, không tạo message mới cho mỗi event.
+
+Wave 14 đăng ký slash commands một lần khi official bot ready: `/status`, `/incidents`, `/presence` và `/maintenance`. Hãy đặt `ADMIN_USER_IDS` bằng danh sách ID Discord admin phân tách bằng dấu phẩy; chỉ admin mới bật/tắt maintenance.
+
+Wave 15 dùng `config-backup.js`, lưu tối đa 5 bản backup nhỏ trong file `.backups.json`, xác minh SHA-256 trước rollback và ghi atomic. Dữ liệu runtime nằm trong thư mục `data/` và không được commit.
+
 ## Tài liệu tham khảo
 
 Discord rate limits: <https://docs.discord.com/developers/topics/rate-limits>

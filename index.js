@@ -9,6 +9,8 @@ const { RestTrafficGovernor } = require('./rest-governor');
 const { createIncidentTimeline } = require('./incident-timeline');
 const { createRemoteConfig } = require('./remote-config');
 const { createStorageAdapter } = require('./storage-adapter');
+const { isNightSaverActive, createAnomalyGuard, buildIncidentDigest } = require('./ops-guard');
+const { createConfigBackup } = require('./config-backup');
 
 const { Client, Options, RichPresence } = require('discord.js-selfbot-v13');
 
@@ -67,7 +69,12 @@ const TIME_FILE = path.join(__dirname, 'starttime.json');
 const OBSERVABILITY_FILE = process.env.OBSERVABILITY_FILE || path.join(__dirname, 'data', 'observability.json');
 const observability = createObservability(OBSERVABILITY_FILE, { sampleEveryMs: 5 * 60 * 1000 });
 const timeline = createIncidentTimeline(process.env.INCIDENTS_FILE || path.join(__dirname, 'data', 'incidents.json'));
+const anomalyGuard = createAnomalyGuard({ cooldownMs: 30 * 60 * 1000 });
 const remoteConfig = createRemoteConfig(process.env.REMOTE_CONFIG_FILE || path.join(__dirname, 'data', 'remote-config.json'));
+const configBackup = createConfigBackup(process.env.REMOTE_CONFIG_FILE || path.join(__dirname, 'data', 'remote-config.json'));
+const existingConfigBackup = configBackup.list()[0];
+if (!existingConfigBackup || existingConfigBackup.checksum !== configBackup.checksum(remoteConfig.get())) configBackup.backup(remoteConfig.get());
+let maintenanceMode = false;
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
 if (process.env.PERSISTENCE_URL) persistence.read().then((snapshot) => {
@@ -135,6 +142,9 @@ app.get('/health', (_req, res) => {
     rateLimitCount,
     recentErrors,
     presence: { category: currentPresenceCategory, durationMinutes: currentPresenceDurationMinutes },
+    nightSaver: { active: isNightSaverActive(), start: process.env.NIGHT_SAVER_START || '23:00', end: process.env.NIGHT_SAVER_END || '07:00', timezone: process.env.NIGHT_SAVER_TZ || 'Asia/Ho_Chi_Minh' },
+    anomalyGuard: anomalyGuard.snapshot(),
+    maintenanceMode,
     observability: observability.summary(),
     restGovernor: restGovernor.snapshot(),
     incidents: timeline.recent(20),
@@ -159,6 +169,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/incidents', (_req, res) => res.status(200).json({ window: '24h', events: timeline.recent(50) }));
+app.get('/config', (_req, res) => res.status(200).json({ version: remoteConfig.get().version, config: remoteConfig.get(), audit: remoteConfig.audit() }));
 
 app.get('/ready', (_req, res) => {
   const officialReady = !officialBot || officialBot.client.isReady();
@@ -509,6 +520,10 @@ const ROTATE_MIN_MS = 10 * 60 * 1000;
 const ROTATE_MAX_MS = 20 * 60 * 1000;
 
 function scheduleDetailRotation(doSetPresence) {
+  if (isNightSaverActive()) {
+    setTimeout(() => scheduleDetailRotation(doSetPresence), 15 * 60 * 1000).unref();
+    return;
+  }
   const next = presenceEngine.next();
   setTimeout(() => {
     currentDetails = Math.random() < 0.20 ? buildMatrixEntry() : next.text;
@@ -932,7 +947,7 @@ let welcomeTimerRunning = false;
 
 function queueWelcomeEvent(type, member) {
   if (!BOT_TOKEN) return;
-  if ((type === 'join' && DISABLE_WELCOME) || (type === 'leave' && DISABLE_GOODBYE)) return;
+  if (isNightSaverActive() || (type === 'join' && DISABLE_WELCOME) || (type === 'leave' && DISABLE_GOODBYE)) return;
   const memberId = String(member?.id || 'unknown');
   const duplicate = welcomeQueue.some((item) => item.type === type && String(item.member?.id || '') === memberId);
   if (duplicate) return;
@@ -994,6 +1009,13 @@ if (!OFFICIAL_BOT_MODE || !BOT_TOKEN) client.on('guildMemberRemove', (member) =>
   queueWelcomeEvent('leave', member);
 });
 
+const COMMANDS = [
+  { name: 'status', description: 'Xem trạng thái bot và tài nguyên Render' },
+  { name: 'incidents', description: 'Xem incident trong 24 giờ' },
+  { name: 'presence', description: 'Xem activity hiện tại' },
+  { name: 'maintenance', description: 'Bật/tắt maintenance mode (admin)' },
+];
+const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
 const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
   ? createOfficialBot({
       token: BOT_TOKEN,
@@ -1002,6 +1024,27 @@ const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
       goodbyeChannelId: DISABLE_GOODBYE ? null : GOODBYE_CHANNEL_ID,
       onMemberJoin: (member) => queueWelcomeEvent('join', member),
       onMemberLeave: (member) => queueWelcomeEvent('leave', member),
+      commands: COMMANDS,
+      onCommand: async (interaction) => {
+        if (interaction.commandName === 'status') {
+          const response = await fetch(STATUS_URL, { signal: AbortSignal.timeout(8_000) });
+          const health = await response.json();
+          return interaction.reply({ embeds: [buildStatusEmbed(health)], ephemeral: true });
+        }
+        if (interaction.commandName === 'incidents') {
+          const digest = buildIncidentDigest(timeline.recent(50));
+          return interaction.reply({ content: `${digest.text}\n${digest.events.map((e) => `• ${e.code}: ${e.message}`).join('\n') || 'Không có incident mới.'}`, ephemeral: true });
+        }
+        if (interaction.commandName === 'presence') {
+          return interaction.reply({ content: `🎮 ${currentDetails}\n🏷️ ${currentPresenceCategory} · ⏱️ ${currentPresenceDurationMinutes} phút`, ephemeral: true });
+        }
+        if (interaction.commandName === 'maintenance') {
+          if (!ADMIN_USER_IDS.has(interaction.user.id)) return interaction.reply({ content: '⛔ Bạn không có quyền dùng lệnh này.', ephemeral: true });
+          maintenanceMode = !maintenanceMode;
+          timeline.record('MAINTENANCE', maintenanceMode ? 'Maintenance bật' : 'Maintenance tắt');
+          return interaction.reply({ content: maintenanceMode ? '🛠️ Maintenance mode đã bật.' : '✅ Maintenance mode đã tắt.', ephemeral: true });
+        }
+      },
       onError: (error) => { errorCount++; logger.error('[official-bot] Client error:', error.message); },
     })
   : null;
@@ -1113,6 +1156,7 @@ function buildStatusEmbed(health) {
     ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
     : (health.playtimeH || '—');
   const hasErrors = Boolean(health.recentErrors && health.recentErrors.length > 0);
+  const digest = buildIncidentDigest(health.incidents || timeline.recent(50));
   const ts = new Date().toLocaleString('vi-VN', { hour12: false, timeZone: 'Asia/Ho_Chi_Minh' });
 
   const uniqueErrors = [];
@@ -1153,6 +1197,11 @@ function buildStatusEmbed(health) {
         name: '💾 Bộ Nhớ & Tài Nguyên (Render 24/7)',
         value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\n${progressBar(ramRatio)} ${(ramRatio * 100).toFixed(1)}%\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${formatMiB(realHeapMb)} MiB**\nUptime: **${uptimeH}h**`,
         inline: true,
+      },
+      {
+        name: `${digest.icon} Incident Digest · ${digest.level}`,
+        value: `${digest.text}\n${isNightSaverActive() ? '🌙 Night Saver đang hoạt động · REST giảm tải' : '☀️ Chế độ thường · monitor theo lịch'}\n${digest.events.slice(-5).map((e) => `${e.code} · ${e.message}`).join('\n') || 'Không có incident mới trong 30 phút.'}`,
+        inline: false,
       },
       {
         name: '📋 Log Lỗi Code & Hệ Thống (Copy trực tiếp)',
@@ -1242,13 +1291,17 @@ async function pushStatusEmbed(embed) {
 }
 
 async function runMonitorTick() {
-  if (Date.now() < monitorRateLimitedUntil) return;
-  if (monitorInFlight) return;
+  if (monitorInFlight || maintenanceMode || Date.now() < monitorRateLimitedUntil) return;
   monitorInFlight = true;
   try {
     const res = await fetch(STATUS_URL, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`HTTP ${res.status} khi gọi ${STATUS_URL}`);
     const health = await res.json();
+    const anomaly = anomalyGuard.evaluate(health, health.incidents || timeline.recent(50));
+    if (anomaly) {
+      timeline.record(anomaly.code, anomaly.reasons.join(' · '), { severity: anomaly.severity });
+      health.incidents = timeline.recent(50);
+    }
     await pushStatusEmbed(buildStatusEmbed(health));
   } catch (e) {
     if (isDiscordRateLimitError(e)) {

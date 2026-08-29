@@ -26,6 +26,16 @@ services:
         sync: false
       - key: EMBED_COLOR
         value: "0x6d5dfc"
+      - key: NIGHT_SAVER_ENABLED
+        value: "true"
+      - key: NIGHT_SAVER_START
+        value: "23:00"
+      - key: NIGHT_SAVER_END
+        value: "07:00"
+      - key: NIGHT_SAVER_TZ
+        value: "Asia/Ho_Chi_Minh"
+      - key: ADMIN_USER_IDS
+        sync: false
       - key: DISABLE_WELCOME
         value: "false"
       - key: DISABLE_GOODBYE
