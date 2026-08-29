@@ -5,7 +5,7 @@ const {
   ActivityType,
 } = require('discord.js');
 
-function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChannelId, memberEvents = false, commands = [], onCommand, onMemberJoin, onMemberLeave, onError }) {
+function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChannelId, memberEvents = false, commands = [], onCommand, onInteraction, onMemberJoin, onMemberLeave, onError }) {
   if (!token) return null;
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, ...(memberEvents ? [GatewayIntentBits.GuildMembers] : [])],
@@ -25,9 +25,11 @@ function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChann
   }
   client.on('error', (error) => onError?.(error));
   client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand() || !onCommand) return;
-    try { await onCommand(interaction); }
-    catch (error) {
+    if (!onInteraction && !(interaction.isChatInputCommand() && onCommand)) return;
+    try {
+      if (onInteraction) await onInteraction(interaction);
+      else if (interaction.isChatInputCommand()) await onCommand(interaction);
+    } catch (error) {
       onError?.(error);
       if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: '⚠️ Lệnh gặp lỗi tạm thời.', ephemeral: true }).catch(() => {});
     }
@@ -38,16 +40,16 @@ function createOfficialBot({ token, logChannelId, welcomeChannelId, goodbyeChann
     const channel = await client.channels.fetch(channelId);
     return channel?.isTextBased?.() ? channel : null;
   }
-  async function sendEmbed(channelId, embed) {
+  async function sendEmbed(channelId, embed, components = []) {
     const channel = await getChannel(channelId);
     if (!channel) throw new Error(`Official bot không tìm thấy text channel ${channelId}`);
-    return channel.send({ embeds: [embed] });
+    return channel.send({ embeds: [embed], ...(components.length ? { components } : {}) });
   }
-  async function editEmbed(channelId, messageId, embed) {
+  async function editEmbed(channelId, messageId, embed, components = []) {
     const channel = await getChannel(channelId);
     if (!channel) throw new Error(`Official bot không tìm thấy text channel ${channelId}`);
     const message = await channel.messages.fetch(messageId);
-    return message.edit({ embeds: [embed] });
+    return message.edit({ embeds: [embed], ...(components.length ? { components } : {}) });
   }
   async function findRecentEmbed(channelId, titlePart) {
     const channel = await getChannel(channelId);

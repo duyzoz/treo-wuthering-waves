@@ -86,6 +86,16 @@ Wave 29 cung cấp `/public` dạng HTML inline, tự refresh 60 giây, không l
 
 Profile chính thức tách riêng ở `render-official.yaml`. Các biến `MAX_REQUESTS_PER_DAY`, `MAX_DISCORD_UPDATES_PER_DAY`, `MAX_IO_PER_DAY` có thể giảm thêm nếu muốn ưu tiên tuổi thọ Render Free.
 
+## Game Studio Panel
+
+Official bot có thêm lệnh `/create` và hai button trong status embed: **Đổi Game** và **Tùy Chỉnh**. Đổi Game mở select menu gồm 10 preset gacha: Wuthering Waves, Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, Arknights, Blue Archive, NIKKE, Reverse: 1999, Love and Deepspace và Tower of Fantasy.
+
+Tùy Chỉnh mở modal để nhập game ID, status, thời lượng phút, URL ảnh game lớn và URL logo nhỏ. URL phải là HTTPS; server không tải ảnh về Render. Mỗi user có profile riêng trong `data/game-profiles.json`, tối đa 250 profile và ghi atomic.
+
+Các button dùng official bot Gateway hiện có, phản hồi chọn game/modal đều là **ephemeral**, nên không spam channel. Status embed chính chỉ thêm hai button và không mở thêm Gateway connection.
+
+Lưu ý: Discord bot chính thức không thể sửa rich presence trên profile tài khoản người dùng và không thể chạy selfbot riêng cho từng user. Panel này lưu preset/preview cá nhân; chỉ cấu hình global của owner mới được áp dụng vào bot presence. Đây là giới hạn API và cũng là cách an toàn để public source không biến thành hệ thống user-token hàng loạt.
+
 ## Tài liệu tham khảo
 
 Discord rate limits: <https://docs.discord.com/developers/topics/rate-limits>

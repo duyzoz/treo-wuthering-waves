@@ -14,6 +14,8 @@ const { createConfigBackup } = require('./config-backup');
 const { createResourceGovernor, nextAdaptiveDelay } = require('./resource-governor');
 const { healthScore, trend, budgetHud, isMaintenanceWindowActive } = require('./dashboard-metrics');
 const { createSafeCleanup } = require('./safe-cleanup');
+const { createGameProfileStore, GAME_PRESETS, normalizeProfile } = require('./game-profiles');
+const { panelComponents, gameSelectComponents, customizeModal, previewText } = require('./game-panel');
 
 const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
 const selfbotLib = FULL_OFFICIAL_MODE
@@ -85,6 +87,7 @@ if (!existingConfigBackup || existingConfigBackup.checksum !== configBackup.chec
 let maintenanceMode = false;
 const trendHistory = [];
 const safeCleanup = createSafeCleanup({ rootDir: path.join(__dirname, 'data', 'tmp') });
+const gameProfiles = createGameProfileStore(path.join(__dirname, 'data', 'game-profiles.json'));
 const ADMIN_CONFIG_KEY = process.env.ADMIN_CONFIG_KEY || '';
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
@@ -1069,13 +1072,15 @@ if (!OFFICIAL_BOT_MODE || !BOT_TOKEN) client.on('guildMemberRemove', (member) =>
 });
 
 const COMMANDS = [
+  { name: 'create', description: 'Mở bảng chọn game và tùy chỉnh status cá nhân' },
   { name: 'status', description: 'Xem trạng thái bot và tài nguyên Render' },
   { name: 'incidents', description: 'Xem incident trong 24 giờ' },
   { name: 'presence', description: 'Xem activity hiện tại' },
   { name: 'maintenance', description: 'Bật/tắt maintenance mode (admin)' },
 ];
 const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
-const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
+  const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
+
   ? createOfficialBot({
       token: BOT_TOKEN,
       logChannelId: LOG_CHANNEL_ID,
@@ -1085,7 +1090,28 @@ const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
       onMemberJoin: (member) => queueWelcomeEvent('join', member),
       onMemberLeave: (member) => queueWelcomeEvent('leave', member),
       commands: COMMANDS,
-      onCommand: async (interaction) => {
+      onInteraction: async (interaction) => {
+        if (interaction.isButton?.() && interaction.customId === 'game:change') {
+          return interaction.reply({ content: `🎮 **Chọn game** · ${GAME_PRESETS.length} preset gacha demo`, components: gameSelectComponents(), ephemeral: true });
+        }
+        if (interaction.isButton?.() && interaction.customId === 'game:customize') return interaction.showModal(customizeModal());
+        if (interaction.isStringSelectMenu?.() && interaction.customId === 'game:select') {
+          const profile = gameProfiles.set(interaction.user.id, normalizeProfile({ gameId: interaction.values[0] }));
+          return interaction.update({ content: `✅ Đã lưu cấu hình riêng cho bạn.\n\n${previewText(profile)}\n\n⚠️ Đây là profile cá nhân; không ghi đè status của user khác.`, components: [] });
+        }
+        if (interaction.isModalSubmit?.() && interaction.customId === 'game:customize_modal') {
+          const profile = gameProfiles.set(interaction.user.id, {
+            gameId: interaction.fields.getTextInputValue('game_id'),
+            status: interaction.fields.getTextInputValue('status'),
+            durationMinutes: interaction.fields.getTextInputValue('duration'),
+            largeImageUrl: interaction.fields.getTextInputValue('large_image'),
+            smallImageUrl: interaction.fields.getTextInputValue('small_image'),
+          });
+          return interaction.reply({ content: `✅ Đã lưu tùy chỉnh riêng của bạn.\n\n${previewText(profile)}\n\n📌 URL phải là HTTPS; ảnh chỉ được Discord tải khi hiển thị.`, ephemeral: true });
+        }
+        if (!interaction.isChatInputCommand?.()) return;
+        if (interaction.commandName === 'create') return interaction.reply({ content: '🌌 **Treo Game Studio**\nChọn game hoặc tùy chỉnh profile cá nhân. Phản hồi này chỉ bạn nhìn thấy.', components: panelComponents(), ephemeral: true });
+
         if (interaction.commandName === 'status') {
           const response = await fetch(STATUS_URL, { signal: AbortSignal.timeout(8_000) });
           const health = await response.json();
@@ -1124,12 +1150,12 @@ processStartTime = uptimeStartTimestamp;
 logger.info(`[timer] Tiếp tục uptime — đã chạy ${((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1)}h (nguồn: starttime.json).`);
 
 function sendLogEmbed(embed) {
-  if (officialBot) return officialBot.sendEmbed(LOG_CHANNEL_ID, embed);
+  if (officialBot) return officialBot.sendEmbed(LOG_CHANNEL_ID, embed, panelComponents());
   return discordApi(`/channels/${LOG_CHANNEL_ID}/messages`, { method: 'POST', body: JSON.stringify({ embeds: [embed] }) });
 }
 
 function editLogEmbed(messageId, embed) {
-  if (officialBot) return officialBot.editEmbed(LOG_CHANNEL_ID, messageId, embed);
+  if (officialBot) return officialBot.editEmbed(LOG_CHANNEL_ID, messageId, embed, panelComponents());
   return discordApi(`/channels/${LOG_CHANNEL_ID}/messages/${messageId}`, { method: 'PATCH', body: JSON.stringify({ embeds: [embed] }) });
 }
 
