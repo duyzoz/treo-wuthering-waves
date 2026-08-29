@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "discord.js-selfbot-v13": "^3.7.1",
-    "express": "^5.2.1",
-    "discord.js": "^14.21.0"
+    "express": "^5.2.1"
   }
 }

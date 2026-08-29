@@ -18,3 +18,9 @@ services:
         sync: false
       - key: FAKE_MEMBER_OFFSET
         value: "1280"
+      - key: MONITOR_INTERVAL_MS
+        value: "300000"
+      - key: WELCOME_THROTTLE_MS
+        value: "1800000"
+      - key: UPTIME_START_TIMESTAMP
+        sync: false

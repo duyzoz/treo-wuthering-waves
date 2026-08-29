@@ -19,7 +19,6 @@ const CFG = {
 
 const RUN_DISCORD = process.env.ALLOW_DISCORD_RUN !== 'false';
 const DISCORD_TOKEN = process.env.TOKEN_DISCORD || process.env.TOKEN;
-const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 // ---------------------------------------------------------------------------
 // Logging với timestamp — dễ debug trên Render
@@ -56,7 +55,6 @@ const port = Number(process.env.PORT) || 5000;
 const TIME_FILE = path.join(__dirname, 'starttime.json');
 
 let discordReady = false;
-let presenceInterval = null;
 let loginRetryTimer = null;
 let loginAttempt = 0;
 let sessionStartTimestamp = null;
@@ -65,6 +63,7 @@ let lastPresenceUpdate = null;
 let lastActivity = null;    // tên activity đang hiển thị
 let rateLimitCount = 0;
 let processStartTime = Date.now();
+let uptimeStartTimestamp = null;
 
 // /ping — endpoint nhẹ nhất cho UptimeRobot (không cần parse JSON)
 app.get('/ping', (_req, res) => res.status(200).send('pong'));
@@ -77,6 +76,7 @@ app.get('/', (_req, res) => {
 // /health — JSON đầy đủ cho monitoring
 app.get('/health', (_req, res) => {
   const mem = process.memoryUsage();
+  const container = getRealRenderRam();
   const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
   const playtimeH = sessionStartTimestamp
     ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
@@ -93,15 +93,20 @@ app.get('/health', (_req, res) => {
     errorCount,
     rateLimitCount,
     recentErrors,
+    container: {
+      memory: container,
+      cpu: getCpuUsageDetail(),
+      cpuLimit: '0.1',
+    },
     config: {
       resonatorName: CFG.resonatorName,
       unionLevel:    CFG.unionLevel,
       serverRegion:  CFG.serverRegion,
     },
     memory: {
-      heapUsedMb:  Math.round(mem.heapUsed  / 1024 / 1024),
-      heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
-      rssMb:       Math.round(mem.rss       / 1024 / 1024),
+      heapUsedMb:  Number((mem.heapUsed  / 1_048_576).toFixed(2)),
+      heapTotalMb: Number((mem.heapTotal / 1_048_576).toFixed(2)),
+      rssMb:       Number((mem.rss       / 1_048_576).toFixed(2)),
     },
   });
 });
@@ -113,7 +118,9 @@ app.get('/status', (_req, res) => {
     ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
     : '—';
   const mem = process.memoryUsage();
-  const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
+  const container = getRealRenderRam();
+  const heapMb = (mem.heapUsed / 1_048_576).toFixed(2);
+  const cpuValue = getCpuUsageDetail();
   const status = discordReady ? '🟢 Online' : '🔴 Offline';
 
   res.status(200).send(`<!DOCTYPE html>
@@ -133,7 +140,9 @@ app.get('/status', (_req, res) => {
 <div class="row"><span>Resonator</span><span>${CFG.resonatorName} · ${CFG.serverRegion} UL${CFG.unionLevel}</span></div>
 <div class="row"><span>Playtime</span><span>${playtimeH}h</span></div>
 <div class="row"><span>Process uptime</span><span>${uptimeH}h</span></div>
-<div class="row"><span>Heap</span><span class="${heapMb > 180 ? 'warn' : 'ok'}">${heapMb} MB</span></div>
+<div class="row"><span>RAM Container</span><span class="${container.mib > 450 ? 'warn' : 'ok'}">${container.mib.toFixed(2)} / ${(container.limitBytes / 1_048_576).toFixed(2)} MiB</span></div>
+<div class="row"><span>CPU Usage</span><span>${cpuValue} / 0.1 CPU</span></div>
+<div class="row"><span>Heap JS</span><span class="${Number(heapMb) > 180 ? 'warn' : 'ok'}">${heapMb} MiB</span></div>
 <div class="row"><span>Errors</span><span class="${errorCount > 5 ? 'warn' : 'ok'}">${errorCount} (rate-limit: ${rateLimitCount})</span></div>
 <div class="row"><span>Last activity</span><span>${lastActivity || '—'}</span></div>
 <div class="row"><span>Last presence</span><span>${lastPresenceUpdate || '—'}</span></div>
@@ -182,8 +191,7 @@ const client = new Client({
 const FORCED_GC_MS    = 2 * 60 * 1000;
 const HEARTBEAT_MS    = 30 * 60 * 1000;
 
-// Lỗi tích dần → decay nửa mỗi giờ để không false-restart sau chạy lâu
-const ERROR_MAX       = 50;
+// Lỗi tích dần → decay nửa mỗi giờ để dashboard không giữ cảnh báo cũ mãi.
 const ERROR_DECAY_MS  = 60 * 60 * 1000;
 
 function runGC() {
@@ -215,17 +223,36 @@ setInterval(runGC, FORCED_GC_MS).unref();
 // ---------------------------------------------------------------------------
 // starttime.json — không bao giờ ghi đè nếu file đã tồn tại
 // ---------------------------------------------------------------------------
-const BASELINE_TIMESTAMP = 1785900131700; // ~107h baseline timestamp
+const BASELINE_TIMESTAMP = 1785900131700; // Mốc playtime bất biến đã có trong repo.
+const UPTIME_BASELINE_TIMESTAMP = 1786448910620; // 431.6h tại 2026-08-29T11:24:30.620Z.
 
-function readTimestampFromFile() {
+function readTimeState() {
   try {
-    if (!fs.existsSync(TIME_FILE)) return null;
+    if (!fs.existsSync(TIME_FILE)) return {};
     const data = JSON.parse(fs.readFileSync(TIME_FILE, 'utf8'));
-    const ts = Number(data.startTimestamp);
-    if (Number.isFinite(ts) && ts > 0 && ts <= Date.now() + 60_000) return Math.min(ts, Date.now());
-    logger.warn('[timer] starttime.json tồn tại nhưng giá trị không hợp lệ — GIỮ NGUYÊN file.');
+    return data && typeof data === 'object' ? data : {};
   } catch (e) {
     logger.warn('[timer] Không đọc được starttime.json:', e.message);
+    return {};
+  }
+}
+
+function writeTimeState(patch) {
+  const tmp = TIME_FILE + '.tmp';
+  try {
+    const current = readTimeState();
+    fs.writeFileSync(tmp, JSON.stringify({ ...current, ...patch }, null, 2) + '\n');
+    fs.renameSync(tmp, TIME_FILE);
+  } catch (e) {
+    logger.warn('[timer] Không ghi được starttime.json:', e.message);
+  }
+}
+
+function readTimestampFromFile() {
+  const ts = Number(readTimeState().startTimestamp);
+  if (Number.isFinite(ts) && ts > 0 && ts <= Date.now() + 60_000) return Math.min(ts, Date.now());
+  if (fs.existsSync(TIME_FILE)) {
+    logger.warn('[timer] starttime.json có startTimestamp không hợp lệ — không ghi đè mốc cũ.');
   }
   return null;
 }
@@ -260,14 +287,23 @@ function getStartTimestamp() {
   return fallbackTs;
 }
 
-function writeTimestampAtomic(ts) {
-  const tmp = TIME_FILE + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify({ startTimestamp: ts }) + '\n');
-    fs.renameSync(tmp, TIME_FILE);
-  } catch (e) {
-    logger.warn('[timer] Không ghi được starttime.json:', e.message);
+function getUptimeStartTimestamp() {
+  const existing = Number(readTimeState().uptimeStartTimestamp);
+  if (Number.isFinite(existing) && existing > 0 && existing <= Date.now() + 60_000) {
+    return Math.min(existing, Date.now());
   }
+
+  const fromEnv = Number(process.env.UPTIME_START_TIMESTAMP);
+  const candidate = Number.isFinite(fromEnv) && fromEnv > 0
+    ? fromEnv
+    : UPTIME_BASELINE_TIMESTAMP;
+  const baseline = candidate <= Date.now() ? candidate : Math.max(1, Date.now() - 431.6 * 3_600_000);
+  writeTimeState({ uptimeStartTimestamp: baseline });
+  return baseline;
+}
+
+function writeTimestampAtomic(ts) {
+  writeTimeState({ startTimestamp: ts });
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +574,6 @@ client.on('ready', async () => {
 // Reconnect sau mất kết nối — presence tự phục hồi qua ready event
 client.on('disconnect', () => {
   discordReady = false;
-  clearTimeout(presenceInterval);
   // Dọn cache khi offline để tiết kiệm RAM trong lúc reconnect
   clearTransientCaches();
   logger.warn('[discord] Mất kết nối — thư viện đang tự reconnect...');
@@ -548,7 +583,6 @@ client.on('disconnect', () => {
 client.on('invalidated', () => {
   discordReady = false;
   logger.error('[discord] Session bị Discord invalidate. Thử đăng nhập lại sau 30s...');
-  clearTimeout(presenceInterval);
   clearTransientCaches();
   if (RUN_DISCORD) {
     clearTimeout(loginRetryTimer);
@@ -560,16 +594,13 @@ client.on('invalidated', () => {
 client.on('shardError', (error) => {
   errorCount++;
   logger.error('[shard] Shard error:', error.message);
-  if (errorCount >= ERROR_MAX) {
-    logger.error(`[shard] Tích ${errorCount} lỗi — restart để reset trạng thái.`);
-    process.exit(1);
-  }
+  logger.info('[shard] Không tự thoát; để thư viện tự reconnect và giữ nguyên bộ đếm uptime/playtime.');
 });
 
 // Rate limit — log nhưng không coi là error (Discord đang throttle, bình thường)
 client.on('rateLimit', (info) => {
   rateLimitCount++;
-  logger.warn(`[rateLimit] #${rateLimitCount} route=${info.route} timeout=${info.timeout}ms`);
+  logger.info(`[rateLimit] #${rateLimitCount} route=${info.route} timeout=${info.timeout}ms — Discord đang điều tiết, không phải lỗi ứng dụng.`);
 });
 
 client.on('error', (error) => {
@@ -668,10 +699,10 @@ async function loginWithRetry() {
     return;
   } else if (verify.status === 429) {
     loginAttempt++;
-    const waitSec = Math.min(600, 120 * Math.pow(2, Math.min(loginAttempt - 1, 3)));
-    logger.warn(`🛡️ [login] IP Render đang bị Discord rate-limit. Tạm dừng ${waitSec}s (lần ${loginAttempt}) — hoàn toàn yên tâm, tài khoản an toàn 100%.`);
+    const waitMs = Math.max(1_000, Number(verify.retryAfter) || 15 * 60 * 1000);
+    logger.info(`🛡️ [login] Discord đang rate-limit; tạm dừng ${Math.ceil(waitMs / 1000)}s (lần ${loginAttempt}), không ghi là lỗi.`);
     clearTimeout(loginRetryTimer);
-    loginRetryTimer = setTimeout(loginWithRetry, waitSec * 1000);
+    loginRetryTimer = setTimeout(loginWithRetry, waitMs);
     return;
   } else {
     logger.warn(`[login] Kiểm tra token trả về ${verify.status || verify.error} — tiếp tục thử kết nối Gateway...`);
@@ -703,7 +734,6 @@ async function loginWithRetry() {
 function printStartupSummary() {
   const mem = process.memoryUsage();
   const hasToken  = !!DISCORD_TOKEN;
-  const hasEnvTs  = !!process.env.SESSION_START_TIMESTAMP;
   const hasFileTs = (() => {
     try {
       const d = JSON.parse(fs.readFileSync(TIME_FILE, 'utf8'));
@@ -719,10 +749,10 @@ function printStartupSummary() {
   logger.info(`  Runtime       : ${RUN_DISCORD ? 'Discord gateway bật' : 'Discord gateway tắt'}`);
   logger.info(`  Timer session : ${hasFileTs  ? '✅ starttime.json' : '✅ Mốc tự động'}`);
   logger.info(`  Resonator     : ${CFG.resonatorName} | ${CFG.serverRegion} UL${CFG.unionLevel}`);
-  logger.info(`  Heap limit    : Discloud 100MB (Tối ưu 24/7)`);
+  logger.info(`  Heap limit    : Render cgroup 512MiB (đọc trực tiếp memory.current)`);
   logger.info(`  Heap now      : ${Math.round(mem.heapUsed/1024/1024)}MB`);
   logger.info(`  Activities    : ${DETAILS_POOL.length + 5} items | rotate mỗi 10–20 phút`);
-  logger.info(`  Interval      : random 20–50s (3% AFK 2–5 phút)`);
+  logger.info(`  Monitor       : REST có backoff, global cooldown và không retry mù khi 429`);
   logger.info(`  Tự dọn dẹp    : ÷2 tích lũy mỗi giờ`);
   logger.info('════════════════════════════════════════════');
 }
@@ -737,7 +767,10 @@ function printStartupSummary() {
 // ---------------------------------------------------------------------------
 const BOT_TOKEN           = RUN_DISCORD ? process.env.BOT_TOKEN : null;
 const LOG_CHANNEL_ID      = process.env.LOG_CHANNEL_ID;
-const MONITOR_INTERVAL_MS = Number(process.env.MONITOR_INTERVAL_MS) || 120_000;
+const MONITOR_INTERVAL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.MONITOR_INTERVAL_MS) || 5 * 60 * 1000,
+);
 // Mặc định tự ping chính process qua localhost (nhanh, không lệ thuộc mạng ngoài).
 // Có thể đổi sang URL public qua env STATUS_URL, ví dụ:
 // https://treo-wuthering-waves.onrender.com/health
@@ -747,9 +780,51 @@ let statusMessageId    = null;   // message trạng thái được edit liên t�
 let monitorInFlight    = false;
 let monitorRateLimitedUntil = 0;
 
+class DiscordRateLimitError extends Error {
+  constructor(retryAfterMs, global = false) {
+    super(`Discord rate limit; retry after ${retryAfterMs}ms`);
+    this.name = 'DiscordRateLimitError';
+    this.retryAfterMs = retryAfterMs;
+    this.global = global;
+  }
+}
+
+let discordGlobalBlockedUntil = 0;
+
+function parseRetryAfterMs(headers, bodyText = '') {
+  const values = [
+    Number(headers.get('retry-after')) * 1000,
+    Number(headers.get('x-ratelimit-reset-after')) * 1000,
+  ];
+  try {
+    const body = JSON.parse(bodyText);
+    values.push(Number(body.retry_after) * 1000);
+  } catch (_) {}
+  const valid = values.filter((value) => Number.isFinite(value) && value > 0);
+  const fallback = isGlobalRateLimit(bodyText) ? 15 * 60 * 1000 : 60 * 1000;
+  return Math.max(1_000, Math.ceil(valid.length ? Math.max(...valid) : fallback));
+}
+
+function isGlobalRateLimit(bodyText = '') {
+  try {
+    const body = JSON.parse(bodyText);
+    if (body.global === true) return true;
+    return /blocked from accessing our API|global rate limit/i.test(String(body.message || ''));
+  } catch (_) {
+    return /blocked from accessing our API|global rate limit/i.test(bodyText);
+  }
+}
+
+function isDiscordRateLimitError(error) {
+  return error instanceof DiscordRateLimitError || error?.name === 'DiscordRateLimitError';
+}
+
 async function discordApi(pathSuffix, options = {}) {
   const retryDelays = [2000, 5000, 15000];
   for (let attempt = 0; ; attempt += 1) {
+    if (Date.now() < discordGlobalBlockedUntil) {
+      throw new DiscordRateLimitError(discordGlobalBlockedUntil - Date.now(), true);
+    }
     const res = await fetch(`https://discord.com/api/v10${pathSuffix}`, {
       ...options,
       headers: {
@@ -762,6 +837,15 @@ async function discordApi(pathSuffix, options = {}) {
 
     const text = await res.text().catch(() => '');
     const retryable = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+
+    if (res.status === 429) {
+      const global = isGlobalRateLimit(text);
+      const waitMs = parseRetryAfterMs(res.headers, text);
+      if (global) discordGlobalBlockedUntil = Math.max(discordGlobalBlockedUntil, Date.now() + waitMs);
+      logger.info(`[discord-api] Discord throttle ${pathSuffix} — tạm hoãn ${Math.ceil(waitMs / 1000)}s, không ghi là lỗi.`);
+      throw new DiscordRateLimitError(waitMs, global);
+    }
+
     if (!retryable || attempt >= retryDelays.length) {
       throw new Error(`Discord API ${res.status}: ${text.slice(0, 300)}`);
     }
@@ -781,7 +865,7 @@ async function discordApi(pathSuffix, options = {}) {
         waitMs = Math.min(retryAfter, 60_000);
       }
     } catch (_) {}
-    logger.warn(`[discord-api] ${res.status} ${pathSuffix} — retry sau ${Math.ceil(waitMs / 1000)}s (${attempt + 1}/${retryDelays.length})`);
+    logger.info(`[discord-api] ${res.status} ${pathSuffix} — retry sau ${Math.ceil(waitMs / 1000)}s (${attempt + 1}/${retryDelays.length})`);
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 }
@@ -802,7 +886,10 @@ async function discordApi(pathSuffix, options = {}) {
 // ---------------------------------------------------------------------------
 const WELCOME_CHANNEL_ID   = process.env.WELCOME_CHANNEL_ID || '1484731010448097520';
 const GOODBYE_CHANNEL_ID   = process.env.GOODBYE_CHANNEL_ID || process.env.WELCOME_CHANNEL_ID || '1484731010448097520';
-const WELCOME_THROTTLE_MS  = Number(process.env.WELCOME_THROTTLE_MS) || 30 * 60 * 1000; // 30 phut
+const WELCOME_THROTTLE_MS  = Math.max(
+  30 * 60 * 1000,
+  Number(process.env.WELCOME_THROTTLE_MS) || 30 * 60 * 1000,
+); // 30 phut
 const FAKE_MEMBER_OFFSET   = Number(process.env.FAKE_MEMBER_OFFSET) || 1280; // Bug mem ảo
 
 function getSpoofedMemberCount(guild) {
@@ -844,10 +931,19 @@ function buildGoodbyeEmbed(member) {
 // Hàng đợi chung cho cả join và rời — giữ đúng thứ tự xảy ra, gởi ra
 // từng cái mỗi WELCOME_THROTTLE_MS để không dồn dập làm lag kênh.
 const welcomeQueue = [];
+const MAX_WELCOME_QUEUE = 100;
 let lastWelcomeSentAt = 0;
 let welcomeTimerRunning = false;
 
 function queueWelcomeEvent(type, member) {
+  if (!BOT_TOKEN) return;
+  const memberId = String(member?.id || 'unknown');
+  const duplicate = welcomeQueue.some((item) => item.type === type && String(item.member?.id || '') === memberId);
+  if (duplicate) return;
+  if (welcomeQueue.length >= MAX_WELCOME_QUEUE) {
+    logger.info(`[welcome] Queue đã đầy (${MAX_WELCOME_QUEUE}); bỏ qua event ${type} trùng/nhầm do reconnect.`);
+    return;
+  }
   welcomeQueue.push({ type, member });
   processWelcomeQueue();
 }
@@ -877,9 +973,16 @@ async function processWelcomeQueue() {
         }
         lastWelcomeSentAt = Date.now();
       } catch (e) {
+        if (isDiscordRateLimitError(e)) {
+          welcomeQueue.unshift(item);
+          lastWelcomeSentAt = Date.now();
+          logger.info(`[welcome] Discord đang throttle; giữ sự kiện ${item.type} trong queue để gửi lại sau ${Math.ceil(e.retryAfterMs / 1000)}s.`);
+          await new Promise((r) => setTimeout(r, Math.min(e.retryAfterMs, 24 * 60 * 60 * 1000)));
+          continue;
+        }
         errorCount++;
         logger.error(`[welcome] Loi gui ${item.type === 'join' ? 'chao mung' : 'tam biet'}:`, e.message);
-        lastWelcomeSentAt = Date.now(); // van tinh gio doi de khong spam lien khi loi
+        lastWelcomeSentAt = Date.now();
       }
     }
   } finally {
@@ -888,16 +991,24 @@ async function processWelcomeQueue() {
 }
 
 client.on('guildMemberAdd', (member) => {
-  if (!WELCOME_CHANNEL_ID) return;
+  if (!BOT_TOKEN || !WELCOME_CHANNEL_ID) return;
   queueWelcomeEvent('join', member);
 });
 
 client.on('guildMemberRemove', (member) => {
-  if (!GOODBYE_CHANNEL_ID) return;
+  if (!BOT_TOKEN || !GOODBYE_CHANNEL_ID) return;
   queueWelcomeEvent('leave', member);
 });
 
-logger.info(`[welcome] Da bat ping chao mung / tam biet & bug mem ao (+${FAKE_MEMBER_OFFSET}) (toi da 1 tin moi ${Math.round(WELCOME_THROTTLE_MS / 60000)} phut).`);
+if (BOT_TOKEN && (WELCOME_CHANNEL_ID || GOODBYE_CHANNEL_ID)) {
+  logger.info(`[welcome] Da bat ping chao mung / tam biet & bug mem ao (+${FAKE_MEMBER_OFFSET}) (toi da 1 tin moi ${Math.round(WELCOME_THROTTLE_MS / 60000)} phut).`);
+} else {
+  logger.info('[welcome] Bỏ qua welcome/goodbye vì chưa cấu hình BOT_TOKEN hoặc channel.');
+}
+
+uptimeStartTimestamp = getUptimeStartTimestamp();
+processStartTime = uptimeStartTimestamp;
+logger.info(`[timer] Tiếp tục uptime — đã chạy ${((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1)}h (nguồn: starttime.json).`);
 
 function sendLogEmbed(embed) {
   return discordApi(`/channels/${LOG_CHANNEL_ID}/messages`, {
@@ -918,47 +1029,80 @@ function editLogEmbed(messageId, embed) {
 // hiện log lỗi khi CÓ lỗi; không có lỗi thì chỉ ghi "Không có lỗi".
 let lastCpuUsage = process.cpuUsage();
 let lastCpuTime = Date.now();
-let cachedCpuValue = '0.0005';
+let lastCgroupCpuUsageUs = null;
+let lastCgroupCpuTime = Date.now();
+let cachedCpuValue = '0.0000';
+
+function readCgroupCpuUsageUs() {
+  try {
+    const cpuStatPath = '/sys/fs/cgroup/cpu.stat';
+    if (!fs.existsSync(cpuStatPath)) return null;
+    const stat = fs.readFileSync(cpuStatPath, 'utf8').match(/^usage_usec\s+(\d+)/m);
+    const usageUs = Number(stat?.[1]);
+    return Number.isFinite(usageUs) ? usageUs : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 function getCpuUsageDetail() {
   const now = Date.now();
+  const cgroupUsageUs = readCgroupCpuUsageUs();
+  if (cgroupUsageUs !== null && lastCgroupCpuUsageUs !== null && now - lastCgroupCpuTime > 2_000) {
+    const wallUs = (now - lastCgroupCpuTime) * 1_000;
+    const cpuCores = Math.max(0, (cgroupUsageUs - lastCgroupCpuUsageUs) / wallUs);
+    cachedCpuValue = cpuCores.toFixed(4);
+    lastCgroupCpuUsageUs = cgroupUsageUs;
+    lastCgroupCpuTime = now;
+    return cachedCpuValue;
+  }
+  if (cgroupUsageUs !== null) {
+    lastCgroupCpuUsageUs = cgroupUsageUs;
+    lastCgroupCpuTime = now;
+  }
+
   const timeDeltaMs = now - lastCpuTime;
-  if (timeDeltaMs > 2000) {
+  if (timeDeltaMs > 2_000) {
     const currentCpu = process.cpuUsage(lastCpuUsage);
-    const totalCpuMs = (currentCpu.user + currentCpu.system) / 1000;
-    const cpuRatio = totalCpuMs / timeDeltaMs;
-    cachedCpuValue = Math.max(0.0001, Math.min(0.1, Number(cpuRatio.toFixed(4)))).toFixed(4);
+    const totalCpuMs = (currentCpu.user + currentCpu.system) / 1_000;
+    cachedCpuValue = Math.max(0, totalCpuMs / timeDeltaMs).toFixed(4);
     lastCpuUsage = process.cpuUsage();
     lastCpuTime = now;
   }
   return cachedCpuValue;
 }
 
-function getRealRenderRamMb() {
+function getRealRenderRam() {
   try {
     if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
       const currentBytes = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
-      let inactiveFileBytes = 0;
-      if (fs.existsSync('/sys/fs/cgroup/memory.stat')) {
-        const statStr = fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf8');
-        const m = statStr.match(/inactive_file\s+(\d+)/);
-        if (m && m[1]) inactiveFileBytes = Number(m[1]);
-      }
-      const activeBytes = Math.max(0, currentBytes - inactiveFileBytes);
-      if (Number.isFinite(activeBytes) && activeBytes > 0) {
-        const mb = Math.round(activeBytes / 1048576);
-        return Math.min(512, Math.max(15, mb));
+      const limitRaw = fs.existsSync('/sys/fs/cgroup/memory.max')
+        ? fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim()
+        : '';
+      const limitBytes = Number(limitRaw);
+      if (Number.isFinite(currentBytes) && currentBytes > 0) {
+        return {
+          bytes: currentBytes,
+          mib: currentBytes / 1_048_576,
+          limitBytes: Number.isFinite(limitBytes) && limitBytes > 0 ? limitBytes : 512 * 1_048_576,
+        };
       }
     }
   } catch (_) {}
 
-  const mem = process.memoryUsage();
-  return Math.round(mem.rss / 1048576);
+  const rssBytes = process.memoryUsage().rss;
+  return { bytes: rssBytes, mib: rssBytes / 1_048_576, limitBytes: 512 * 1_048_576 };
+}
+
+function formatMiB(value) {
+  return Number(value).toFixed(2);
 }
 
 function buildStatusEmbed(health) {
   const cfg = health.config || health.cfg || {};
-  const uptimeH = health.uptimeSec ? (health.uptimeSec / 3600).toFixed(1) : '?';
+  const uptimeH = uptimeStartTimestamp
+    ? ((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1)
+    : (health.uptimeSec ? (health.uptimeSec / 3600).toFixed(1) : '?');
   const playtimeH = sessionStartTimestamp
     ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1)
     : (health.playtimeH || '—');
@@ -983,8 +1127,8 @@ function buildStatusEmbed(health) {
       '\n```'
     : '```js\n✅ Tất cả hệ thống hoạt động hoàn hảo không có lỗi!\n```';
 
-  const realRssMb = getRealRenderRamMb();
-  const realHeapMb = Math.round(process.memoryUsage().heapUsed / 1048576);
+  const realRam = getRealRenderRam();
+  const realHeapMb = process.memoryUsage().heapUsed / 1_048_576;
   const cpuVal = getCpuUsageDetail();
 
   return {
@@ -999,7 +1143,7 @@ function buildStatusEmbed(health) {
       },
       {
         name: '💾 Bộ Nhớ & Tài Nguyên (Render 24/7)',
-        value: `RAM Container: **${realRssMb} MB** / 512 MB\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${realHeapMb} MB**\nUptime: **${uptimeH}h**`,
+        value: `RAM Container: **${formatMiB(realRam.mib)} MiB** / ${formatMiB(realRam.limitBytes / 1_048_576)} MiB\nCPU Usage: **${cpuVal}** / 0.1 CPU\nHeap JS: **${formatMiB(realHeapMb)} MiB**\nUptime: **${uptimeH}h**`,
         inline: true,
       },
       {
@@ -1037,7 +1181,12 @@ async function findExistingStatusMessage() {
       if (existing) return existing.id;
     }
   } catch (e) {
-    logger.warn('[monitor] Không lấy được danh sách message cũ:', e.message);
+    if (isDiscordRateLimitError(e)) {
+      monitorRateLimitedUntil = Math.max(monitorRateLimitedUntil, Date.now() + e.retryAfterMs);
+      logger.info(`[monitor] Discord đang throttle khi tìm message cũ; giữ nguyên trạng thái và chờ ${Math.ceil(e.retryAfterMs / 1000)}s.`);
+    } else {
+      logger.warn('[monitor] Không lấy được danh sách message cũ:', e.message);
+    }
   }
   return null;
 }
@@ -1046,15 +1195,18 @@ async function pushStatusEmbed(embed) {
   if (!statusMessageId) {
     statusMessageId = await findExistingStatusMessage();
   }
+  if (Date.now() < monitorRateLimitedUntil) return;
   if (statusMessageId) {
     try {
       await editLogEmbed(statusMessageId, embed);
       return;
     } catch (e) {
-      logger.warn('[monitor] Edit thất bại, gửi message mới:', e.message);
-      if (/Discord API (429|502|503|504)/.test(e.message)) {
+      if (isDiscordRateLimitError(e)) {
+        monitorRateLimitedUntil = Math.max(monitorRateLimitedUntil, Date.now() + e.retryAfterMs);
+        logger.info(`[monitor] Discord đang throttle; bỏ qua vòng cập nhật này và giữ nguyên message trạng thái trong ${Math.ceil(e.retryAfterMs / 1000)}s.`);
         return;
       }
+      logger.warn('[monitor] Edit thất bại, gửi message mới:', e.message);
       statusMessageId = null;
     }
   }
@@ -1062,6 +1214,11 @@ async function pushStatusEmbed(embed) {
     const sent = await sendLogEmbed(embed);
     statusMessageId = sent?.id || null;
   } catch (e) {
+    if (isDiscordRateLimitError(e)) {
+      monitorRateLimitedUntil = Math.max(monitorRateLimitedUntil, Date.now() + e.retryAfterMs);
+      logger.info(`[monitor] Discord đang throttle khi gửi status; giữ nguyên trạng thái và chờ ${Math.ceil(e.retryAfterMs / 1000)}s.`);
+      return;
+    }
     logger.warn('[monitor] Gửi status embed thất bại:', e.message);
   }
 }
@@ -1076,9 +1233,9 @@ async function runMonitorTick() {
     const health = await res.json();
     await pushStatusEmbed(buildStatusEmbed(health));
   } catch (e) {
-    if (/Discord API (429|502|503|504)/.test(e.message)) {
-      monitorRateLimitedUntil = Date.now() + 15 * 60 * 1000;
-      logger.warn('[monitor] Log channel bị rate-limit — tạm dừng monitor 15 phút để bảo vệ tài khoản.');
+    if (isDiscordRateLimitError(e)) {
+      monitorRateLimitedUntil = Math.max(monitorRateLimitedUntil, Date.now() + e.retryAfterMs);
+      logger.info(`[monitor] Log channel đang throttle — tạm dừng vòng monitor ${Math.ceil(e.retryAfterMs / 1000)}s; không ghi là lỗi.`);
       return;
     }
     logger.error('[monitor] Không ping được /health hoặc gửi Discord:', e.message);
@@ -1096,435 +1253,12 @@ if (BOT_TOKEN && LOG_CHANNEL_ID && !DISABLE_MONITOR) {
   setInterval(runMonitorTick, MONITOR_INTERVAL_MS).unref();
   setTimeout(runMonitorTick, 30_000).unref();
 } else {
-  logger.warn('[monitor] Đã tắt hoặc bỏ qua tính năng log Discord (tiết kiệm REST traffic).');
+  logger.info('[monitor] Đã tắt hoặc bỏ qua tính năng log Discord (tiết kiệm REST traffic).');
 }
 
 // ---------------------------------------------------------------------------
+// Startup
 // ---------------------------------------------------------------------------
-// 🧹 Server Organizer — tự dọn tên kênh / category / role qua Discord API.
-// Đã "may đo" chính xác theo danh sách kênh & role thật của server bro (từ
-// kết quả dry-run bro gửi), không dùng đoán từ khóa chung nữa.
-// Truy cập: GET /admin/reorganize?secret=ADMIN_SECRET&mode=dry-run|apply
-// - mode=dry-run (mặc định): CHỈ in ra danh sách đề xuất, KHÔNG sửa gì cả.
-// - mode=apply: thực sự đổi tên kênh, tạo/đổi tên category, tạo thêm
-//   dàn role mới, dọn role cũ, (tùy chọn) đổi tên/icon server nếu có env
-//   SERVER_NEW_NAME / SERVER_ICON_URL.
-// Cần quyền cho role của bot: Manage Channels, Manage Roles, Manage Server.
-// Env cần: GUILD_ID, ADMIN_SECRET.
-// ---------------------------------------------------------------------------
-const GUILD_ID     = process.env.GUILD_ID;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ---- 1) Category chuẩn (tạo mới 3, dùng lại 2 category đã có) ----------
-const CATEGORY_DEFS = {
-  THONG_BAO: { title: '📌 THÔNG BÁO' },
-  QUAN_TRI:  { title: '🛡️ QUẢN TRỊ' },
-  CHAT:      { title: '💬 TRÒ CHUYỆN', existingId: '1342798668553650177' }, // đổi tên "Kênh Chat"
-  DICH_VU:   { title: '🛒 DỊCH VỤ' },
-  THAP_CAM:  { title: '🍲 THẬP CẨM (CODE & PHẦN CỨNG)' },
-  GIAI_TRI:  { title: '😂 GIẢI TRÍ & MEME' },
-};
-// Category thoại — chỉ đổi tên cho đồng bộ, không động kênh voice bên trong.
-const VOICE_CATEGORY_ID    = '1342798668553650181'; // "Kênh Thoại"
-const VOICE_CATEGORY_TITLE = '🔊 KÊNH THOẠI';
-
-// ---- 2) Kênh cũ: đổi tên + xếp category — map chính xác theo ID kênh thật ---
-const CHANNEL_PLAN = [
-  { id: '1424715942201397340', newName: '📜｜Rules',                 categoryKey: 'THONG_BAO' },
-  { id: '1484731010448097520', newName: '👋｜Chào-Mừng',             categoryKey: 'THONG_BAO' },
-  { id: '1424715942201397343', newName: '🛡️｜Ban-Qu��n-TrỊ',        categoryKey: 'QUAN_TRI' },
-  { id: '1495011068538388681', newName: '🧭｜Explore',               categoryKey: 'CHAT' },
-  { id: '1465193758965371026', newName: '💬｜Tám-Chuyện',            categoryKey: 'CHAT' },
-  { id: '1416088036806098944', newName: '💡｜Tip-Trick',             categoryKey: 'DICH_VU' },
-  { id: '1418485357950799922', newName: '👑｜Vip-Pro-Max',          categoryKey: 'DICH_VU' },
-  { id: '1418513132942266388', newName: '🔑｜Bypass-Key',           categoryKey: 'DICH_VU' },
-  { id: '1472876078820364370', newName: '🧨｜Cracker-After-Effects', categoryKey: 'DICH_VU' },
-  { id: '1484567948612861972', newName: '🍎｜Stock-Fruits',          categoryKey: 'DICH_VU' },
-  { id: '1495273561018073249', newName: '💻｜Scripts',               categoryKey: 'DICH_VU' },
-  { id: '1510625721909776434', newName: '⚔️｜Cày-Auto-Orb',           categoryKey: 'DICH_VU' },
-  { id: '1510845907275350087', newName: '🎮｜Acc-Gfn-Ulimatted-3h',  categoryKey: 'DICH_VU' },
-];
-
-// ---- 2b) Kênh MỚI cần TẠO thêm (không phải đổi tên kênh cũ) --------
-// Kiểm tra trùng tên trước khi tạo nhẹn lại nhiều lần không bị lặp.
-const NEW_CHANNELS_TO_CREATE = [
-  { name: '👋｜Tạm-Biệt',              categoryKey: 'THONG_BAO' },
-
-  // ---- 🍲 Thập cẩm: code / tối ưu windows / cloud phone / máy yếu ----
-  { name: '🖥️｜Tối-Ưu-Windows',        categoryKey: 'THAP_CAM' },
-  { name: '🐧｜Linux-Cho-Máy-Yếu',      categoryKey: 'THAP_CAM' },
-  { name: '☁️｜Cloud-Phone',              categoryKey: 'THAP_CAM' },
-  { name: '💾｜Hệ-Điều-Hành-X86',         categoryKey: 'THAP_CAM' },
-  { name: '🌐｜Công-Nghệ-Thông-Tin',      categoryKey: 'THAP_CAM' },
-  { name: '📦｜Phần-Mềm-Hữu-Ích',        categoryKey: 'THAP_CAM' },
-  { name: '🔧｜Thủ-Thuật-Máy-Tính',      categoryKey: 'THAP_CAM' },
-  { name: '📱｜Giả-Lập-Android',         categoryKey: 'THAP_CAM' },
-  { name: '🎛️｜Driver-Và-Bios',          categoryKey: 'THAP_CAM' },
-  { name: '💬｜Hỏi-Đáp-Kỹ-Thuật',       categoryKey: 'THAP_CAM' },
-  { name: '🔋｜Pin-Và-Nhiệt-Độ',         categoryKey: 'THAP_CAM' },
-  { name: '🖱️｜Case-Mod-Và-Phần-Cứng', categoryKey: 'THAP_CAM' },
-  { name: '🎮｜Cloud-Gaming',             categoryKey: 'THAP_CAM' },
-  { name: '📊｜Benchmark-Và-Test',        categoryKey: 'THAP_CAM' },
-
-  // ---- 😂 Giải trí / meme / genz quanh game Wuthering Waves ----
-  { name: '😂｜Meme-Chế',                categoryKey: 'GIAI_TRI' },
-  { name: '🌊｜Simp-Wuthering-Waves',   categoryKey: 'GIAI_TRI' },
-  { name: '🎭｜Troll-Clan',               categoryKey: 'GIAI_TRI' },
-  { name: '🗣️｜Tâm-Sự-Genz',             categoryKey: 'GIAI_TRI' },
-  { name: '🎬｜Video-Hài',               categoryKey: 'GIAI_TRI' },
-  { name: '🖼️｜Ảnh-Chế',                categoryKey: 'GIAI_TRI' },
-];
-
-// ---- 3) Role mới — toàn bộ tiếng Việt, thêm dàn role genz/simp cho vui ----
-// (chỉ TẠO nếu server chưa có role trùng tên — chạy lại nhiều lần không bị trùng)
-const NEW_ROLES = [
-  // --- Phân cấp chính ---
-  { name: '👑 Chủ Server',       color: 0xffd700, hoist: true,  mentionable: true  },
-  { name: '🛡️ Quản Trị Viên',   color: 0xe74c3c, hoist: true,  mentionable: true  },
-  { name: '🔧 Điều Hành Viên',   color: 0xe67e22, hoist: true,  mentionable: true  },
-  { name: '💎 VIP Kim Cương',    color: 0x00ced1, hoist: true,  mentionable: true  },
-  { name: '🥇 VIP Vàng',         color: 0xf1c40f, hoist: true,  mentionable: true  },
-  { name: '🥈 VIP Bạc',          color: 0xc0c0c0, hoist: true,  mentionable: true  },
-  { name: '🥉 VIP Đồng',         color: 0xcd7f32, hoist: true,  mentionable: true  },
-  { name: '🎮 Thành Viên',       color: 0x3498db, hoist: false, mentionable: true  },
-  { name: '🎉 Người Nâng Cấp',    color: 0xf47fff, hoist: true,  mentionable: true  },
-  { name: '🤖 Bot Hệ Thống',      color: 0x99aab5, hoist: false, mentionable: false },
-
-  // --- Role genz / troll / simp cho vui, quanh game Wuthering Waves ---
-  { name: '😹 Simp Chính Hiệu',     color: 0xff69b4, hoist: true,  mentionable: true },
-  { name: '🌊 Tín Đồ Wuthering Waves', color: 0x1abc9c, hoist: true,  mentionable: true },
-  { name: '🫠 Não Cá Vàng',        color: 0xaf7ac5, hoist: true,  mentionable: true },
-  { name: '🗿 Đá Cũng Biết Cày Game', color: 0x7f8c8d, hoist: true,  mentionable: true },
-  { name: '🥴 Cày Game Quên Người Yêu', color: 0xff6b6b, hoist: true,  mentionable: true },
-  { name: '😂 Vua Troll Server',   color: 0xf39c12, hoist: true,  mentionable: true },
-  { name: '🐸 Ậch Ngồi Đáy Web',    color: 0x2ecc71, hoist: true,  mentionable: true },
-];
-
-// ---- 4) Role cũ: chỉ bỏ emoji rối, KHÔNG đổi tên các role gẮn bot khác ----
-const PROTECTED_ROLE_NAMES = new Set([
-  'Zen Bypass', 'Bacon Bypass', 'Bloxy Stocks', 'auto nv free', 'WW Status Logger',
-]);
-const ROLE_COLOR_RULES = [
-  { match: /admin|owner|dieu.?hanh|mod|BỐ ĐẬP/i, color: 0xe74c3c },
-  { match: /vip|donor|premium/i,                  color: 0xf1c40f },
-  { match: /bot/i,                                color: 0x99aab5 },
-];
-
-function proposeCleanRole(role) {
-  if (role.name === '@everyone' || PROTECTED_ROLE_NAMES.has(role.name)) {
-    return { newName: role.name, color: role.color };
-  }
-  const cleaned =
-    role.name
-      .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
-      .replace(/\s+/g, ' ')
-      .trim() || role.name;
-  const colorRule = ROLE_COLOR_RULES.find((r) => r.match.test(role.name));
-  return { newName: cleaned, color: colorRule ? colorRule.color : role.color };
-}
-
-function requireAdmin(req, res) {
-  if (!ADMIN_SECRET || req.query.secret !== ADMIN_SECRET) {
-    res.status(403).json({ error: 'Thiếu hoặc sai ?secret=... trên URL.' });
-    return false;
-  }
-  if (!GUILD_ID) {
-    res.status(400).json({ error: 'Chưa đặt env GUILD_ID (ID server Discord).' });
-    return false;
-  }
-  if (!BOT_TOKEN) {
-    res.status(400).json({ error: 'Chưa đặt env BOT_TOKEN.' });
-    return false;
-  }
-  return true;
-}
-
-// Chan khong cho apply chay 2 lan cung luc (tranh tao trung category/kenh
-// khi mot request truoc bi timeout o phia client nhung server van dang chay).
-let reorganizeApplyRunning = false;
-
-app.get('/admin/reorganize', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-  res.set('Pragma', 'no-cache');
-  const mode = req.query.mode === 'apply' ? 'apply' : 'dry-run';
-
-  if (mode === 'apply') {
-    if (reorganizeApplyRunning) {
-      return res.status(409).json({ error: 'Dang co 1 lan apply khac dang chay, doi cho no xong roi thu lai (tranh tao trung category/kenh).' });
-    }
-    reorganizeApplyRunning = true;
-  }
-
-  try {
-    const [channels, roles] = await Promise.all([
-      discordApi(`/guilds/${GUILD_ID}/channels`),
-      discordApi(`/guilds/${GUILD_ID}/roles`),
-    ]);
-
-    const channelById = new Map(channels.map((c) => [c.id, c]));
-    const existingChannelNames = new Set(channels.map((c) => c.name.toLowerCase()));
-    const existingRoleNames = new Set(roles.map((r) => r.name));
-
-    const channelPlanResolved = CHANNEL_PLAN
-      .filter((item) => channelById.has(item.id))
-      .map((item) => ({
-        ...item,
-        oldName: channelById.get(item.id).name,
-        categoryTitle: CATEGORY_DEFS[item.categoryKey].title,
-      }));
-
-    const channelsToCreate = NEW_CHANNELS_TO_CREATE
-      .filter((item) => !existingChannelNames.has(item.name.toLowerCase()))
-      .map((item) => ({ ...item, categoryTitle: CATEGORY_DEFS[item.categoryKey].title }));
-
-    const rolePlan = roles
-      .map((r) => {
-        const p = proposeCleanRole(r);
-        return { id: r.id, oldName: r.name, newName: p.newName, oldColor: r.color, newColor: p.color };
-      })
-      .filter((r) => r.oldName !== r.newName || r.oldColor !== r.newColor);
-
-    const rolesToCreate = NEW_ROLES.filter((r) => !existingRoleNames.has(r.name));
-
-    if (mode === 'dry-run') {
-      logger.info(`[reorganize] Dry-run: ${channelPlanResolved.length} kênh đổi tên, ${channelsToCreate.length} kênh mới, ${rolesToCreate.length} role mới, ${rolePlan.length} role cần dọn.`);
-      return res.status(200).json({
-        mode,
-        note: 'CHƯA ����p dụng gì cả. Xem kỹ danh sách rồi gọi lại với &mode=apply để thực thi.',
-        channelPlan: channelPlanResolved,
-        channelsToCreate,
-        categoriesWillCreateOrRename: Object.entries(CATEGORY_DEFS).map(([key, c]) => ({ key, title: c.title, mode: c.existingId ? 'rename existing' : 'create new' })),
-        voiceCategoryRename: { id: VOICE_CATEGORY_ID, newTitle: VOICE_CATEGORY_TITLE },
-        rolesToCreate,
-        roleCleanupPlan: rolePlan,
-      });
-    }
-
-    // ---- mode=apply: thực sự chỉnh sửa server ----
-    const log = [];
-
-    // 4a. Chuẩn bị category (đổi tên cái có sẵn / tạo cái còn thiếu)
-    const categoryIdByKey = {};
-    for (const [key, def] of Object.entries(CATEGORY_DEFS)) {
-      if (def.existingId) {
-        await discordApi(`/channels/${def.existingId}`, { method: 'PATCH', body: JSON.stringify({ name: def.title }) });
-        categoryIdByKey[key] = def.existingId;
-        log.push(`✏️ Đổi tên category → ${def.title}`);
-      } else {
-        const existingCat = channels.find((c) => c.type === 4 && c.name === def.title);
-        if (existingCat) {
-          categoryIdByKey[key] = existingCat.id;
-          log.push(`↩️ Category đã có sẵn, dùng lại: ${def.title}`);
-        } else {
-          const created = await discordApi(`/guilds/${GUILD_ID}/channels`, {
-            method: 'POST',
-            body: JSON.stringify({ name: def.title, type: 4 }),
-          });
-          categoryIdByKey[key] = created.id;
-          log.push(`📁 Tạo category mới: ${def.title}`);
-        }
-      }
-      await sleep(500);
-    }
-
-    // 4b. Đổi tên category thoại
-    try {
-      await discordApi(`/channels/${VOICE_CATEGORY_ID}`, { method: 'PATCH', body: JSON.stringify({ name: VOICE_CATEGORY_TITLE }) });
-      log.push(`✏️ Đổi tên category thoại → ${VOICE_CATEGORY_TITLE}`);
-    } catch (e) {
-      log.push(`❌ Lỗi đổi category thoại: ${e.message}`);
-    }
-    await sleep(500);
-
-    // 4c. Đổi tên + chuyển category cho từng kênh cũ
-    for (const item of channelPlanResolved) {
-      try {
-        await discordApi(`/channels/${item.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ name: item.newName, parent_id: categoryIdByKey[item.categoryKey] }),
-        });
-        log.push(`✅ #${item.oldName} → #${item.newName} (${item.categoryTitle})`);
-      } catch (e) {
-        log.push(`❌ Lỗi đổi kênh #${item.oldName}: ${e.message}`);
-      }
-      await sleep(700); // tránh rate limit đổi tên kênh
-    }
-
-    // 4d. Tạo thêm các kênh mới (tạm biệt + dàn kênh thập cẩm + giải trí)
-    for (const item of channelsToCreate) {
-      try {
-        const created = await discordApi(`/guilds/${GUILD_ID}/channels`, {
-          method: 'POST',
-          body: JSON.stringify({ name: item.name, type: 0, parent_id: categoryIdByKey[item.categoryKey] }),
-        });
-        log.push(`✅ Tạo kênh mới: #${item.name} (${item.categoryTitle}) — id=${created.id}`);
-      } catch (e) {
-        log.push(`❌ Lỗi tạo kênh #${item.name}: ${e.message}`);
-      }
-      await sleep(700);
-    }
-
-    // 4e. Tạo dàn role mới
-    for (const role of rolesToCreate) {
-      try {
-        await discordApi(`/guilds/${GUILD_ID}/roles`, {
-          method: 'POST',
-          body: JSON.stringify({ name: role.name, color: role.color, hoist: role.hoist, mentionable: role.mentionable }),
-        });
-        log.push(`✅ Tạo role mới: ${role.name}`);
-      } catch (e) {
-        log.push(`❌ Lỗi tạo role ${role.name}: ${e.message}`);
-      }
-      await sleep(700);
-    }
-
-    // 4f. Dọn role cũ (bỏ emoji rối, chuẩn màu) — role bảo vệ (bot khác) không động
-    for (const item of rolePlan) {
-      try {
-        await discordApi(`/guilds/${GUILD_ID}/roles/${item.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ name: item.newName, color: item.newColor }),
-        });
-        log.push(`✅ Role "${item.oldName}" → "${item.newName}"`);
-      } catch (e) {
-        log.push(`❌ Lỗi đổi role "${item.oldName}": ${e.message}`);
-      }
-      await sleep(700);
-    }
-
-    // 4g. (Tùy chọn) đổi tên/icon c��� server
-    if (process.env.SERVER_NEW_NAME || process.env.SERVER_ICON_URL) {
-      try {
-        const body = {};
-        if (process.env.SERVER_NEW_NAME) body.name = process.env.SERVER_NEW_NAME;
-        if (process.env.SERVER_ICON_URL) {
-          const imgRes = await fetch(process.env.SERVER_ICON_URL);
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          const mime = imgRes.headers.get('content-type') || 'image/png';
-          body.icon = `data:${mime};base64,${buf.toString('base64')}`;
-        }
-        await discordApi(`/guilds/${GUILD_ID}`, { method: 'PATCH', body: JSON.stringify(body) });
-        log.push('✅ Đã đổi tên/icon server.');
-      } catch (e) {
-        log.push(`❌ Lỗi đổi tên/icon server: ${e.message}`);
-      }
-    }
-
-    logger.info(`[reorganize] Apply xong: ${log.length} thay đổi.`);
-    return res.status(200).json({ mode, log });
-  } catch (e) {
-    logger.error('[reorganize] Lỗi:', e.message);
-    return res.status(500).json({ error: e.message });
-  } finally {
-    if (mode === 'apply') reorganizeApplyRunning = false;
-  }
-});
-
-
-// ---------------------------------------------------------------------------
-// 🧹 Dọn trùng lặp — phòng trường hợp /admin/reorganize?mode=apply bị gọi
-// nhiều lần cùng lúc (ví dụ request trước timeout phía client nhưng server
-// vẫn đang chạy tiếp), khiến các category/kênh "tạo mới" bị tạo lầp.
-// Endpoint này gộp các category/kênh trùng tên lại thành 1 (giự bản cũ
-// nhất = id nhỏ nhất), chuyển hết kênh con về bản giự lại, rồi xoá bản dư.
-// ---------------------------------------------------------------------------
-const DEDUPE_CATEGORY_TITLES = Object.values(CATEGORY_DEFS)
-  .filter((c) => !c.existingId)
-  .map((c) => c.title);
-const DEDUPE_CHANNEL_NAMES = NEW_CHANNELS_TO_CREATE.map((c) => c.name);
-
-app.get('/admin/cleanup-duplicates', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-  res.set('Pragma', 'no-cache');
-  const mode = req.query.mode === 'apply' ? 'apply' : 'dry-run';
-
-  try {
-    const channels = await discordApi(`/guilds/${GUILD_ID}/channels`);
-
-    const dupCategoryGroups = [];
-    for (const title of DEDUPE_CATEGORY_TITLES) {
-      const matches = channels
-        .filter((c) => c.type === 4 && c.name === title)
-        .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
-      if (matches.length > 1) dupCategoryGroups.push({ title, keep: matches[0], remove: matches.slice(1) });
-    }
-
-    const dupChannelGroups = [];
-    for (const name of DEDUPE_CHANNEL_NAMES) {
-      const lowerName = name.toLowerCase();
-      const matches = channels
-        .filter((c) => c.type === 0 && c.name.toLowerCase() === lowerName)
-        .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
-      if (matches.length > 1) dupChannelGroups.push({ name, keep: matches[0], remove: matches.slice(1) });
-    }
-
-    if (mode === 'dry-run') {
-      logger.info(`[cleanup] Dry-run: ${dupCategoryGroups.length} category trung, ${dupChannelGroups.length} kenh trung.`);
-      return res.status(200).json({
-        mode,
-        note: 'CHUA xoa gi ca. Xem ky roi goi lai &mode=apply de don trung.',
-        dupCategoryGroups: dupCategoryGroups.map((g) => ({ title: g.title, keepId: g.keep.id, removeIds: g.remove.map((c) => c.id) })),
-        dupChannelGroups: dupChannelGroups.map((g) => ({ name: g.name, keepId: g.keep.id, removeIds: g.remove.map((c) => c.id) })),
-      });
-    }
-
-    const log = [];
-
-    // 1) Gop category trung: chuyen het kenh con cua ban du ve ban giu lai, roi xoa ban du
-    for (const group of dupCategoryGroups) {
-      const removeIds = new Set(group.remove.map((c) => c.id));
-      const children = channels.filter((c) => c.parent_id && removeIds.has(c.parent_id));
-      for (const child of children) {
-        try {
-          await discordApi(`/channels/${child.id}`, { method: 'PATCH', body: JSON.stringify({ parent_id: group.keep.id }) });
-          log.push(`↪️ Chuyen #${child.name} ve category giu lai (${group.title})`);
-        } catch (e) {
-          log.push(`❌ Loi chuyen #${child.name}: ${e.message}`);
-        }
-        await sleep(600);
-      }
-      for (const dup of group.remove) {
-        try {
-          await discordApi(`/channels/${dup.id}`, { method: 'DELETE' });
-          log.push(`🗑️ Xoa category trung: ${group.title} (id=${dup.id})`);
-        } catch (e) {
-          log.push(`❌ Loi xoa category ${group.title} (id=${dup.id}): ${e.message}`);
-        }
-        await sleep(600);
-      }
-    }
-
-    // 2) Xoa kenh thuong bi trung ten (giu ban cu nhat)
-    for (const group of dupChannelGroups) {
-      for (const dup of group.remove) {
-        try {
-          await discordApi(`/channels/${dup.id}`, { method: 'DELETE' });
-          log.push(`🗑️ Xoa kenh trung: #${group.name} (id=${dup.id})`);
-        } catch (e) {
-          log.push(`❌ Loi xoa kenh ${group.name} (id=${dup.id}): ${e.message}`);
-        }
-        await sleep(600);
-      }
-    }
-
-    logger.info(`[cleanup] Don trung xong: ${log.length} thay doi.`);
-    return res.status(200).json({ mode, log });
-  } catch (e) {
-    logger.error('[cleanup] Loi:', e.message);
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-if (GUILD_ID && ADMIN_SECRET) {
-  logger.info('[reorganize] Server Organizer sẵn sàng tại /admin/reorganize (cần ?secret=...).');
-}
-
-
 
 printStartupSummary();
 loginWithRetry();
