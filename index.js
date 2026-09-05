@@ -16,6 +16,8 @@ const { healthScore, trend, budgetHud, isMaintenanceWindowActive } = require('./
 const { createSafeCleanup } = require('./safe-cleanup');
 const { createGameProfileStore, GAME_PRESETS, normalizeProfile } = require('./game-profiles');
 const { panelComponents, gameSelectComponents, customizeModal, previewText } = require('./game-panel');
+const { createUserTokenStore } = require('./user-token-store');
+const { runQuestsForUser, getOrbBalance } = require('./quest-runner');
 
 const FULL_OFFICIAL_MODE = process.env.FULL_OFFICIAL_MODE === 'true';
 const selfbotLib = FULL_OFFICIAL_MODE
@@ -88,6 +90,7 @@ let maintenanceMode = false;
 const trendHistory = [];
 const safeCleanup = createSafeCleanup({ rootDir: path.join(__dirname, 'data', 'tmp') });
 const gameProfiles = createGameProfileStore(path.join(__dirname, 'data', 'game-profiles.json'));
+const userTokenStore = createUserTokenStore(path.join(__dirname, 'data', 'user-tokens.json'));
 const ADMIN_CONFIG_KEY = process.env.ADMIN_CONFIG_KEY || '';
 const persistence = createStorageAdapter({ filePath: process.env.PERSISTENCE_FILE || path.join(__dirname, 'data', 'persistence.json'), remoteUrl: process.env.PERSISTENCE_URL || '', remoteToken: process.env.PERSISTENCE_TOKEN || '' });
 let lastExternalPersistAt = 0;
@@ -1077,6 +1080,9 @@ const COMMANDS = [
   { name: 'incidents', description: 'Xem incident trong 24 giờ' },
   { name: 'presence', description: 'Xem activity hiện tại' },
   { name: 'maintenance', description: 'Bật/tắt maintenance mode (admin)' },
+  { name: 'token', description: '🔐 Lưu User Token Discord của bạn để dùng /auto-orb (ephemeral — chỉ bạn thấy)' },
+  { name: 'auto-orb', description: '🔮 Tự động hoàn thành tất cả Discord Quests và nhận Orbs' },
+  { name: 'starstat', description: '🌟 Xem trạng thái hệ thống đẹp với màu động và icon Wuthering Waves' },
 ];
 const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
   const officialBot = OFFICIAL_BOT_MODE && BOT_TOKEN
@@ -1109,6 +1115,24 @@ const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',
           });
           return interaction.reply({ content: `✅ Đã lưu tùy chỉnh riêng của bạn.\n\n${previewText(profile)}\n\n📌 URL phải là HTTPS; ảnh chỉ được Discord tải khi hiển thị.`, ephemeral: true });
         }
+        // Modal submit — lưu user token
+        if (interaction.isModalSubmit?.() && interaction.customId === 'quest:token_modal') {
+          const rawToken = (interaction.fields.getTextInputValue('user_token_input') || '').trim();
+          // Kiểm tra token hợp lệ qua API trước khi lưu
+          await interaction.deferReply({ ephemeral: true });
+          try {
+            const verifyResult = await verifyUserToken(rawToken);
+            if (!verifyResult.ok) {
+              return interaction.editReply({ content: `❌ Token không hợp lệ (${verifyResult.status ?? verifyResult.error ?? 'unknown'}).\nHãy lấy lại token từ DevTools F12 và thử lại.` });
+            }
+            userTokenStore.set(interaction.user.id, rawToken);
+            logger.info(`[token-store] Đã lưu token cho user ${interaction.user.id} (${verifyResult.user?.username ?? '?'})`);
+            return interaction.editReply({ content: `✅ Token của **${verifyResult.user?.username ?? 'bạn'}** đã được lưu thành công!\n🔐 Token được mã hóa AES-256 — không ai có thể đọc kể cả admin.\n\n🔮 Dùng \`/auto-orb\` để tự động nhận Orbs, \`/starstat\` để xem số dư Orbs!` });
+          } catch (err) {
+            logger.error('[token-store] Lỗi verify/lưu token:', err.message);
+            return interaction.editReply({ content: `❌ Lỗi khi xác minh token: ${err.message.slice(0, 100)}` });
+          }
+        }
         if (!interaction.isChatInputCommand?.()) return;
         if (interaction.commandName === 'create') return interaction.reply({ content: '🌌 **Treo Game Studio**\nChọn game hoặc tùy chỉnh profile cá nhân. Phản hồi này chỉ bạn nhìn thấy.', components: panelComponents(), ephemeral: true });
 
@@ -1129,6 +1153,130 @@ const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',
           maintenanceMode = !maintenanceMode;
           timeline.record('MAINTENANCE', maintenanceMode ? 'Maintenance bật' : 'Maintenance tắt');
           return interaction.reply({ content: maintenanceMode ? '🛠️ Maintenance mode đã bật.' : '✅ Maintenance mode đã tắt.', ephemeral: true });
+        }
+
+        // ── /token ──────────────────────────────────────────────────────────
+        if (interaction.commandName === 'token') {
+          return interaction.showModal({
+            custom_id: 'quest:token_modal',
+            title: '🔐 Lưu User Token Discord',
+            components: [{
+              type: 1,
+              components: [{
+                type: 4,
+                custom_id: 'user_token_input',
+                label: 'Dán User Token của bạn vào đây',
+                style: 2,
+                min_length: 50,
+                max_length: 200,
+                placeholder: 'Token tài khoản Discord (lấy từ DevTools F12 → Network → Authorization)',
+                required: true,
+              }],
+            }],
+          });
+        }
+
+        // ── /auto-orb ────────────────────────────────────────────────────────
+        if (interaction.commandName === 'auto-orb') {
+          const userId = interaction.user.id;
+          if (!userTokenStore.has(userId)) {
+            return interaction.reply({ content: '❌ Bạn chưa lưu token. Hãy dùng `/token` trước để đăng ký.', ephemeral: true });
+          }
+          await interaction.deferReply({ ephemeral: true });
+          try {
+            const plainToken = userTokenStore.get(userId);
+            if (!plainToken) throw new Error('Không thể giải mã token. Hãy thử /token lại.');
+            const result = await runQuestsForUser(plainToken);
+            const orbStr = result.orbsAfter !== null ? `🔮 **${result.orbsAfter} Orbs**` : '🔮 Orbs: —';
+            const gainStr = result.orbsGained > 0 ? ` (+${result.orbsGained})` : '';
+            let questLines = '';
+            if (result.allCaughtUp) {
+              questLines = result.quests.map((q) => {
+                const icon = q.status === 'claimed' ? '★' : q.status === 'done' ? '✔' : q.status === 'expired' ? '⏰' : '⏳';
+                return `${icon} **${q.name.slice(0, 36)}** · ${q.reward}`;
+              }).join('\n') || 'Không có quest nào.';
+            } else {
+              questLines = result.quests.map((q) => {
+                const icon = q.status === 'claimed' ? '✅' : '❌';
+                return `${icon} **${q.name.slice(0, 36)}** · ${q.reward}${q.error ? `\n  ⚠️ ${q.error}` : ''}`;
+              }).join('\n') || 'Không có quest nào.';
+            }
+            const embed = {
+              title: result.allCaughtUp ? '🌊 Auto Orb — Tất cả đã nhận! ✨' : '🔮 Auto Orb — Hoàn thành!',
+              color: result.allCaughtUp ? 0x6c5ce7 : (result.quests.some((q) => q.status === 'failed') ? 0xff6b6b : 0x00b894),
+              description: `👤 **${result.username}** · ${orbStr}${gainStr}${result.allCaughtUp ? '\n\n✨ Không có quest chờ xử lý — đã nhận hết Orbs!' : ''}`,
+              fields: [{ name: '📋 Danh sách Quests', value: questLines.slice(0, 1024) || '—', inline: false }],
+              footer: { text: `Wuthering Waves Bot · Auto Quest · ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}` },
+              thumbnail: CFG.statusGif ? { url: CFG.statusGif } : undefined,
+            };
+            return interaction.editReply({ embeds: [embed] });
+          } catch (err) {
+            logger.error('[auto-orb] Lỗi khi chạy quest:', err.message);
+            return interaction.editReply({ content: `❌ Lỗi khi chạy auto quest: ${String(err.message).slice(0, 150)}\n\nGợi ý: Token có thể đã hết hạn, hãy dùng \`/token\` để cập nhật lại.` });
+          }
+        }
+
+        // ── /starstat ────────────────────────────────────────────────────────
+        if (interaction.commandName === 'starstat') {
+          await interaction.deferReply({ ephemeral: true });
+          try {
+            const response = await fetch(STATUS_URL, { signal: AbortSignal.timeout(8_000) });
+            const health = await response.json();
+            const mem = getRealRenderRam();
+            const ramRatio = mem.limitBytes > 0 ? mem.bytes / mem.limitBytes : 0;
+            const score = health.healthScore?.score ?? 0;
+            const scoreColor = score >= 80 ? 0x00b894 : score >= 50 ? 0xfdcb6e : 0xff6b6b;
+            const scoreEmoji = score >= 80 ? '🟢' : score >= 50 ? '🟡' : '🔴';
+            const uptimeH = uptimeStartTimestamp ? ((Date.now() - uptimeStartTimestamp) / 3_600_000).toFixed(1) : '?';
+            const playtimeH = sessionStartTimestamp ? ((Date.now() - sessionStartTimestamp) / 3_600_000).toFixed(1) : '—';
+            const digest = buildIncidentDigest(timeline.recent(50));
+            const ramBar = progressBar(ramRatio, 12);
+            const cpuVal = getCpuUsageDetail();
+            const realHeapMb = process.memoryUsage().heapUsed / 1_048_576;
+            const userId = interaction.user.id;
+            let orbLine = '';
+            if (userTokenStore.has(userId)) {
+              try {
+                const tok = userTokenStore.get(userId);
+                const bal = await getOrbBalance(tok);
+                orbLine = `\n🔮 **Orbs của bạn:** ${bal.orbs ?? '—'} · ${bal.username}`;
+              } catch { orbLine = '\n🔮 **Orbs:** không lấy được (token hết hạn?)'; }
+            }
+            const starEmbed = {
+              title: '🌟 Wuthering Waves · StarStat',
+              color: scoreColor,
+              description: `🌌 **Live Operations Console** · Render Free 24/7\n${scoreEmoji} Health Score: **${score}/100 · ${health.healthScore?.level ?? 'UNKNOWN'}**${orbLine}`,
+              author: { name: 'WW StarStat · Render 24/7', icon_url: CFG.smallImg },
+              thumbnail: CFG.statusGif ? { url: CFG.statusGif } : undefined,
+              fields: [
+                {
+                  name: '🎮 Selfbot · Rich Presence',
+                  value: `${(health.discordReady || health.officialBotReady) ? '🟢 Online' : '🔴 Offline'} · **${playtimeH}h** playtime\n${CFG.resonatorName} | ${CFG.serverRegion} UL${CFG.unionLevel}\n🏷️ **${health.presence?.category ?? 'farming'}** · ⏱️ ${health.presence?.durationMinutes ?? '—'}m\n📝 ${currentDetails.slice(0, 50)}`,
+                  inline: true,
+                },
+                {
+                  name: '💾 Tài Nguyên Render',
+                  value: `RAM: **${formatMiB(mem.mib)}/${formatMiB(mem.limitBytes / 1_048_576)} MiB**\n${ramBar} ${(ramRatio * 100).toFixed(1)}% ${health.trends?.ram ?? '→'}\nCPU: **${cpuVal}** ${health.trends?.cpu ?? '→'}\nHeap: **${formatMiB(realHeapMb)} MiB** ${health.trends?.heap ?? '→'}\n⏱️ Uptime: **${uptimeH}h**`,
+                  inline: true,
+                },
+                {
+                  name: `${digest.icon} Incidents · ${digest.level}`,
+                  value: `${digest.text}\n${isNightSaverActive() ? '🌙 Night Saver ON' : maintenanceMode ? '🛠️ Maintenance' : '☀️ Normal'}\n📦 ${health.budgetHud ?? '—'}`,
+                  inline: false,
+                },
+                {
+                  name: '📈 24h Stats',
+                  value: `RAM: ${health.observability?.ramMiB?.min ?? '—'} / ${health.observability?.ramMiB?.avg ?? '—'} / ${health.observability?.ramMiB?.max ?? '—'} MiB\nCPU: ${health.observability?.cpu?.min ?? '—'} / ${health.observability?.cpu?.avg ?? '—'} / ${health.observability?.cpu?.max ?? '—'}\n🔄 Reconnects: ${health.observability?.reconnects ?? 0} · ⚡ Rate-limits: ${health.observability?.rateLimits ?? 0}`,
+                  inline: false,
+                },
+              ],
+              footer: { text: `Cập nhật lúc ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} · /token để xem Orbs của bạn` },
+            };
+            return interaction.editReply({ embeds: [starEmbed] });
+          } catch (err) {
+            logger.error('[starstat] Lỗi:', err.message);
+            return interaction.editReply({ content: `❌ Không lấy được dữ liệu: ${err.message}` });
+          }
         }
       },
       onError: (error) => {
