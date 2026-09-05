@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "license": "UNLICENSED",
-  "description": "Persistent Wuthering Waves Discord rich presence",
+  "description": "Persistent Wuthering Waves Discord rich presence + Auto Quest Orb Bot",
   "main": "index.js",
   "engines": {
     "node": "20.x"
@@ -11,11 +11,16 @@
   "scripts": {
     "start": "node index.js",
     "start:gc": "node --expose-gc index.js",
-    "test": "node --check index.js && node --check official-bot.js && node --check observability.js && node --check presence-engine.js && node --check rest-governor.js && node --check incident-timeline.js && node --check remote-config.js && node --check storage-adapter.js && node --check ops-guard.js && node --check config-backup.js && node --check resource-governor.js && node --check dashboard-metrics.js && node --check safe-cleanup.js && node --check game-profiles.js && node --check game-panel.js && node test-waves.js"
+    "test": "node --check index.js && node --check official-bot.js && node --check observability.js && node --check presence-engine.js && node --check rest-governor.js && node --check incident-timeline.js && node --check remote-config.js && node --check storage-adapter.js && node --check ops-guard.js && node --check config-backup.js && node --check resource-governor.js && node --check dashboard-metrics.js && node --check safe-cleanup.js && node --check game-profiles.js && node --check game-panel.js && node --check quest-engine.js && node --check quest-store.js && node --check quest-runner.js && node --check user-token-store.js && node test-waves.js"
   },
   "dependencies": {
+    "@discordjs/core": "^1.1.1",
+    "@discordjs/rest": "^2.2.0",
+    "@discordjs/ws": "^1.0.2",
+    "discord-api-types": "^0.37.61",
     "discord.js": "^14.27.0",
     "discord.js-selfbot-v13": "^3.7.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "undici": "^6.0.0"
   }
 }
