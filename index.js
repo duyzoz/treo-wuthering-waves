@@ -1180,9 +1180,9 @@ const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',
         if (interaction.commandName === 'auto-orb') {
           const userId = interaction.user.id;
           if (!userTokenStore.has(userId)) {
-            return interaction.reply({ content: '❌ Bạn chưa lưu token. Hãy dùng `/token` trước để đăng ký.', ephemeral: true });
+            return interaction.reply({ content: '❌ Bạn chưa lưu token. Hãy dùng `/token` trước để đăng ký.', flags: 64 });
           }
-          await interaction.deferReply({ ephemeral: true });
+          await interaction.deferReply({ flags: 64 });
           try {
             const plainToken = userTokenStore.get(userId);
             if (!plainToken) throw new Error('Không thể giải mã token. Hãy thử /token lại.');
@@ -1218,7 +1218,7 @@ const ADMIN_USER_IDS = new Set(String(process.env.ADMIN_USER_IDS || '').split(',
 
         // ── /starstat ────────────────────────────────────────────────────────
         if (interaction.commandName === 'starstat') {
-          await interaction.deferReply({ ephemeral: true });
+          await interaction.deferReply({ flags: 64 });
           try {
             const response = await fetch(STATUS_URL, { signal: AbortSignal.timeout(8_000) });
             const health = await response.json();
